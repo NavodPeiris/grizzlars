@@ -1,4 +1,6 @@
-# grizzlars
+<p align="center">
+  <img src="https://github.com/NavodPeiris/grizzlars/blob/main/banner.png?raw=true" width="700"/>
+</p>
 
 <p align="center">
     <a href="./LICENSE"><img src="https://img.shields.io/github/license/NavodPeiris/grizzlars"></a>
@@ -9,6 +11,8 @@
     <a href="https://github.com/NavodPeiris/grizzlars/stargazers"><img src="https://img.shields.io/github/stars/NavodPeiris/grizzlars?color=ccf"></a>
     <a href="https://pypi.org/project/grizzlars/"><img src="https://static.pepy.tech/badge/grizzlars"></a>
 </p>
+
+# Grizzlars
 
 > A Python DataFrame library backed by a multithreaded C++ engine — built for speed.
 
