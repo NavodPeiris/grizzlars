@@ -56,7 +56,18 @@ else()
     # GCC/Clang parallel algorithms need TBB
     find_package(TBB QUIET)
     if(TBB_FOUND)
-        target_link_libraries(_grizzlars PRIVATE TBB::tbb)
+        # Prefer a static libtbb if available so the extension has no runtime
+        # dependency on a system TBB shared library (avoids undefined symbol
+        # errors when wheels are used on systems without matching TBB).
+        find_library(TBB_STATIC_LIB
+            NAMES tbb_static libtbb_static tbb
+            PATHS /usr/lib /usr/lib64 /usr/local/lib /opt/local/lib
+            NO_DEFAULT_PATH)
+        if(TBB_STATIC_LIB)
+            target_link_libraries(_grizzlars PRIVATE ${TBB_STATIC_LIB})
+        else()
+            target_link_libraries(_grizzlars PRIVATE TBB::tbb)
+        endif()
     endif()
 endif()
 
