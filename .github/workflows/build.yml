@@ -29,8 +29,9 @@ jobs:
           CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
 
           # TBB is required for std::execution parallel policies on GCC/Clang
+          # Also ensure patchelf/unzip/zip are available in the manylinux image
           CIBW_BEFORE_ALL_LINUX: >
-            dnf install -y tbb-devel || yum install -y tbb-devel || true
+            dnf install -y tbb-devel patchelf unzip zip || yum install -y tbb-devel patchelf unzip zip || true
           CIBW_BEFORE_ALL_MACOS: >
             brew install tbb
 
