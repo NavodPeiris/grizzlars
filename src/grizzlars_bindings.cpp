@@ -16,14 +16,26 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <execution>
+#if defined(__has_include)
+#  if __has_include(<execution>)
+#    include <execution>
+#    if defined(__cpp_lib_execution)
+#      define GRIZZLAR_USE_EXECUTION 1
+#    endif
+#  endif
+#endif
 
 // Execution policy compatibility layer
-// macOS/AppleClang doesn't support std::execution::par, so we fall back to sequential
-#ifdef __APPLE__
-#define GRIZZLAR_EXEC_POLICY std::execution::seq
+#if defined(GRIZZLAR_USE_EXECUTION)
+    // Prefer parallel where available; AppleClang's implementation was limited
+#  ifdef __APPLE__
+#    define GRIZZLAR_EXEC_POLICY std::execution::seq
+#  else
+#    define GRIZZLAR_EXEC_POLICY std::execution::par
+#  endif
+#  define GRIZZLAR_SORT(policy, ...) std::sort(policy, __VA_ARGS__)
 #else
-#define GRIZZLAR_EXEC_POLICY std::execution::par
+#  define GRIZZLAR_SORT(policy, ...) std::sort(__VA_ARGS__)
 #endif
 #include <fstream>
 #include <future>
@@ -1622,37 +1634,37 @@ public:
             for (size_t i = 0; i < n; ++i)
                 keys[i] = raw[i];
             if (ascending)
-                std::sort(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                          [&](size_t a, size_t b)
-                          { return keys[a] < keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
+                             [&](size_t a, size_t b)
+                             { return keys[a] < keys[b]; });
             else
-                std::sort(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                          [&](size_t a, size_t b)
-                          { return keys[a] > keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
+                             [&](size_t a, size_t b)
+                             { return keys[a] > keys[b]; });
         }
         else if (type == "int64")
         {
             const auto &keys = df_.get_column<int64_t>(col.c_str());
             if (ascending)
-                std::sort(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                          [&](size_t a, size_t b)
-                          { return keys[a] < keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
+                             [&](size_t a, size_t b)
+                             { return keys[a] < keys[b]; });
             else
-                std::sort(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                          [&](size_t a, size_t b)
-                          { return keys[a] > keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
+                             [&](size_t a, size_t b)
+                             { return keys[a] > keys[b]; });
         }
         else if (type == "double")
         {
             const auto &keys = df_.get_column<double>(col.c_str());
             if (ascending)
-                std::sort(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                          [&](size_t a, size_t b)
-                          { return keys[a] < keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
+                             [&](size_t a, size_t b)
+                             { return keys[a] < keys[b]; });
             else
-                std::sort(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                          [&](size_t a, size_t b)
-                          { return keys[a] > keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
+                             [&](size_t a, size_t b)
+                             { return keys[a] > keys[b]; });
         }
         else
         {
@@ -1669,13 +1681,13 @@ public:
         std::iota(perm.begin(), perm.end(), 0);
         const auto &idx = df_.get_index();
         if (ascending)
-            std::sort(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                      [&](size_t a, size_t b)
-                      { return idx[a] < idx[b]; });
+            GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
+                         [&](size_t a, size_t b)
+                         { return idx[a] < idx[b]; });
         else
-            std::sort(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                      [&](size_t a, size_t b)
-                      { return idx[a] > idx[b]; });
+            GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
+                         [&](size_t a, size_t b)
+                         { return idx[a] > idx[b]; });
         return extract_rows_parallel(perm);
     }
 
