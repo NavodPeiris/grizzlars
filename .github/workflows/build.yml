@@ -43,6 +43,7 @@ jobs:
           # Pass linker flags so the rpath is applied at link time. This helps
           # auditwheel (Linux) / delocate (macOS) detect libtbb for bundling.
           CIBW_LDFLAGS: "-Wl,-rpath,\\'\\$ORIGIN/.libs\\'"
+          CIBW_BEFORE_REPAIR_LINUX: "bash .github/scripts/vendor_tbb.sh"
           CIBW_CFLAGS: "-fPIC"
 
           # Smoke-test every wheel before it is uploaded
