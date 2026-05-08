@@ -21,7 +21,7 @@ from ._grizzlars import (
     get_thread_level,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = ["DataFrame", "read_csv",
            "set_thread_level", "set_optimum_thread_level", "get_thread_level"]
 
