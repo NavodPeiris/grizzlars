@@ -29,6 +29,16 @@ This compiles the C++ Grizzlar library and the pybind11 extension (`_grizzlars`)
 uv run python main.py
 ```
 
+### 3. Run tests
+
+```bash
+uv run pytest tests/functional -q
+```
+
+```bash
+uv run pytest tests/performance -q
+```
+
 ---
 
 ## Troubleshooting

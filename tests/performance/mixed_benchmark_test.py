@@ -30,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
-import grizzlars
+import grizzlars as gl
 
 try:
     import polars as pl
@@ -47,7 +47,7 @@ except ImportError:
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 
-CSV_PATH = Path(__file__).parent / "data" / "Warehouse_and_Retail_Sales.csv"
+CSV_PATH = Path(__file__).parent.parent / "data" / "Warehouse_and_Retail_Sales.csv"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -75,7 +75,7 @@ def fmt_mb(mb: float) -> str:
     return f"{mb:>7.1f} MiB" if mb == mb else "     N/A"
 
 
-def _df_size_mb(df: "grizzlars.DataFrame") -> float:
+def _df_size_mb(df: gl.DataFrame) -> float:
     total = 0
     for col in df.columns:
         raw = df[col]
@@ -91,7 +91,7 @@ def result_row(label: str, t_polars: float, t_grizzlars: float) -> None:
     if t_grizzlars > 0:
         ratio = t_polars / t_grizzlars
         faster, rx = ("grizzlars", ratio) if ratio >= 1 else ("polars", 1 / ratio)
-        note = f"→ {faster} is {rx:.2f}× faster"
+        note = f"→ {faster} is {rx:.2f}x faster"
     else:
         note = ""
     print(
@@ -102,24 +102,24 @@ def result_row(label: str, t_polars: float, t_grizzlars: float) -> None:
 
 # ── loaders ───────────────────────────────────────────────────────────────────
 
-def load_polars() -> "pl.DataFrame":
+def load_polars() -> pl.DataFrame:
     return pl.read_csv(CSV_PATH, schema_overrides={"ITEM CODE": pl.String})
 
 
-def load_grizzlars() -> "grizzlars.DataFrame":
-    return grizzlars.read_csv(str(CSV_PATH))
+def load_grizzlars() -> gl.DataFrame:
+    return gl.read_csv(str(CSV_PATH))
 
 
 # ── individual benchmarks ─────────────────────────────────────────────────────
 
-def bench_sort(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_sort(df_p: pl.DataFrame, df_g: gl.DataFrame):
     tp = elapsed(lambda: df_p.sort("WAREHOUSE SALES", descending=True))[1]
     tg = elapsed(lambda: df_g.sort("WAREHOUSE SALES", ascending=False))[1]
     result_row("sort(WAREHOUSE SALES desc)", tp, tg)
     return tp, tg
 
 
-def bench_filter(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_filter(df_p: pl.DataFrame, df_g: gl.DataFrame):
     def polars_filter():
         return df_p.filter(pl.col("WAREHOUSE SALES") > 0)
 
@@ -137,7 +137,7 @@ def bench_filter(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
     return tp, tg
 
 
-def bench_groupby_low(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_groupby_low(df_p: pl.DataFrame, df_g: gl.DataFrame):
     """Low-cardinality string key: ITEM TYPE (~5 groups)."""
 
     def polars_gb():
@@ -160,7 +160,7 @@ def bench_groupby_low(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
     return tp, tg
 
 
-def bench_groupby_high(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_groupby_high(df_p: pl.DataFrame, df_g: gl.DataFrame):
     """High-cardinality string key: SUPPLIER (hundreds of groups)."""
 
     def polars_gb():
@@ -183,7 +183,7 @@ def bench_groupby_high(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
     return tp, tg
 
 
-def bench_aggregate(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_aggregate(df_p: pl.DataFrame, df_g: gl.DataFrame):
     def polars_agg():
         return df_p.select([
             pl.col("WAREHOUSE SALES").mean().alias("mean"),
@@ -208,7 +208,7 @@ def bench_aggregate(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
     return tp, tg
 
 
-def bench_describe(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_describe(df_p: pl.DataFrame, df_g: gl.DataFrame):
     tp = elapsed(lambda: df_p.describe())[1]
     tg = elapsed(lambda: df_g.describe())[1]
     result_row("describe", tp, tg)

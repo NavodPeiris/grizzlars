@@ -41,7 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
-import grizzlars
+import grizzlars as gl
 
 try:
     import polars as pl
@@ -58,7 +58,7 @@ except ImportError:
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 
-DATA_DIR = Path(__file__).parent / "data" / "stock_data"
+DATA_DIR = Path(__file__).parent.parent / "data" / "stock_data"
 CSV_FILES = sorted(DATA_DIR.glob("*.csv"))
 
 VOLUME_THRESHOLD = 100_000
@@ -89,7 +89,7 @@ def fmt_mb(mb: float) -> str:
     return f"{mb:>7.1f} MiB" if mb == mb else "     N/A"
 
 
-def _df_size_mb(df: "grizzlars.DataFrame") -> float:
+def _df_size_mb(df: gl.DataFrame) -> float:
     total = 0
     for col in df.columns:
         raw = df[col]
@@ -105,7 +105,7 @@ def result_row(label: str, t_polars: float, t_grizzlars: float) -> None:
     if t_grizzlars > 0:
         ratio = t_polars / t_grizzlars
         faster, rx = ("grizzlars", ratio) if ratio >= 1 else ("polars", 1 / ratio)
-        note = f"→ {faster} is {rx:.2f}× faster"
+        note = f"→ {faster} is {rx:.2f}x faster"
     else:
         note = ""
     print(
@@ -116,7 +116,7 @@ def result_row(label: str, t_polars: float, t_grizzlars: float) -> None:
 
 # ── load + stack ──────────────────────────────────────────────────────────────
 
-def load_stack_polars() -> "pl.DataFrame":
+def load_stack_polars() -> pl.DataFrame:
     frames = []
     for path in CSV_FILES:
         ticker = path.stem
@@ -125,11 +125,11 @@ def load_stack_polars() -> "pl.DataFrame":
     return pl.concat(frames)
 
 
-def load_stack_grizzlars() -> "grizzlars.DataFrame":
+def load_stack_grizzlars() -> gl.DataFrame:
     frames = []
     for path in CSV_FILES:
         ticker = path.stem
-        df = grizzlars.read_csv(str(path))
+        df = gl.read_csv(str(path))
         df["Symbol"] = [ticker] * len(df)
         frames.append(df)
     combined = frames[0]
@@ -140,14 +140,14 @@ def load_stack_grizzlars() -> "grizzlars.DataFrame":
 
 # ── individual benchmarks ─────────────────────────────────────────────────────
 
-def bench_sort(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_sort(df_p: pl.DataFrame, df_g: gl.DataFrame):
     tp = elapsed(lambda: df_p.sort("Close"))[1]
     tg = elapsed(lambda: df_g.sort("Close"))[1]
     result_row("sort(Close asc)", tp, tg)
     return tp, tg
 
 
-def bench_filter(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_filter(df_p: pl.DataFrame, df_g: gl.DataFrame):
     def polars_filter():
         return df_p.filter(pl.col("Volume") > VOLUME_THRESHOLD)
 
@@ -165,7 +165,7 @@ def bench_filter(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
     return tp, tg
 
 
-def bench_groupby(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_groupby(df_p: pl.DataFrame, df_g: gl.DataFrame):
     def polars_groupby():
         return (
             df_p.group_by("Symbol")
@@ -187,7 +187,7 @@ def bench_groupby(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
     return tp, tg
 
 
-def bench_aggregate(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_aggregate(df_p: pl.DataFrame, df_g: gl.DataFrame):
     def polars_agg():
         return df_p.select([
             pl.col("Close").mean().alias("mean"),
@@ -212,7 +212,7 @@ def bench_aggregate(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
     return tp, tg
 
 
-def bench_describe(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_describe(df_p: pl.DataFrame, df_g: gl.DataFrame):
     tp = elapsed(lambda: df_p.describe())[1]
     tg = elapsed(lambda: df_g.describe())[1]
     result_row("describe", tp, tg)
@@ -253,7 +253,7 @@ def run_benchmark():
           f"Tickers: {df_p['Symbol'].n_unique()}")
     print()
     print("  ── Load + stack ──────────────────────────────────────────────────────")
-    result_row("read_csv × all + concat", tp_load, tg_load)
+    result_row("read_csv x all + concat", tp_load, tg_load)
 
     print()
     print("  ── Memory ────────────────────────────────────────────────────────────")

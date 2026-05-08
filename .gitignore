@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 output.csv
+
+# Test cache
+.pytest_cache/

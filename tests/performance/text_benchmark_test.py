@@ -1,5 +1,5 @@
 """
-Benchmark: grizzlars vs polars — customer data (100 000 rows × 12 cols).
+Benchmark: grizzlars vs polars — customer data (100 000 rows x 12 cols).
 
 Operations compared
 -------------------
@@ -10,7 +10,7 @@ Operations compared
   5. GroupBy           count customers per Country
   6. Aggregate         mean / sum / std / min / max on Index column
   7. Describe          full stats DataFrame for numeric column (Index)
-  8. Join (inner)      customers ⋈ people on Index (100 000 × 100 000)
+  8. Join (inner)      customers ⋈ people on Index (100 000 x 100 000)
   9. Join (left)       customers LEFT JOIN people[50 000] on Index
 
 Prerequisites
@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-import grizzlars
+import grizzlars as gl
 
 try:
     import polars as pl
@@ -48,8 +48,8 @@ except ImportError:
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 
-CSV_PATH    = Path(__file__).parent / "data" / "customers-100000.csv"
-PEOPLE_PATH = Path(__file__).parent / "data" / "people-100000.csv"
+CSV_PATH    = Path(__file__).parent.parent / "data" / "customers-100000.csv"
+PEOPLE_PATH = Path(__file__).parent.parent / "data" / "people-100000.csv"
 
 # Columns pulled from people that don't clash with customers columns.
 # Both files share First Name / Last Name / Email — those are dropped.
@@ -81,7 +81,7 @@ def fmt_mb(mb: float) -> str:
     return f"{mb:>7.1f} MiB" if mb == mb else "     N/A"
 
 
-def _df_size_mb(df: "grizzlars.DataFrame") -> float:
+def _df_size_mb(df: "gl.DataFrame") -> float:
     total = 0
     for col in df.columns:
         raw = df[col]
@@ -97,7 +97,7 @@ def result_row(label: str, t_polars: float, t_grizzlars: float) -> None:
     if t_grizzlars > 0:
         ratio = t_polars / t_grizzlars
         faster, rx = ("grizzlars", ratio) if ratio >= 1 else ("polars", 1 / ratio)
-        note = f"→ {faster} is {rx:.2f}× faster"
+        note = f"→ {faster} is {rx:.2f}x faster"
     else:
         note = ""
     print(
@@ -108,36 +108,36 @@ def result_row(label: str, t_polars: float, t_grizzlars: float) -> None:
 
 # ── CSV loaders ───────────────────────────────────────────────────────────────
 
-def load_polars() -> "pl.DataFrame":
+def load_polars() -> pl.DataFrame:
     return pl.read_csv(CSV_PATH)
 
 
-def load_grizzlars() -> "grizzlars.DataFrame":
-    return grizzlars.read_csv(str(CSV_PATH))
+def load_grizzlars() -> gl.DataFrame:
+    return gl.read_csv(str(CSV_PATH))
 
 
-def load_people_polars() -> "pl.DataFrame":
+def load_people_polars() -> pl.DataFrame:
     """People CSV — non-clashing columns only, Index kept as join key."""
     return pl.read_csv(PEOPLE_PATH).select(PEOPLE_JOIN_COLS)
 
 
-def load_people_grizzlars() -> "grizzlars.DataFrame":
+def load_people_grizzlars() -> gl.DataFrame:
     """People CSV with Index as frame index; non-clashing columns only."""
-    df = grizzlars.read_csv(str(PEOPLE_PATH), index_col="Index")
+    df = gl.read_csv(str(PEOPLE_PATH), index_col="Index")
     keep = [c for c in df.columns if c in ("User Id", "Sex", "Job Title")]
     return df.select(keep)
 
 
 # ── individual benchmarks ─────────────────────────────────────────────────────
 
-def bench_sort(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_sort(df_p: pl.DataFrame, df_g: gl.DataFrame):
     tp = elapsed(lambda: df_p.sort("Last Name"))[1]
     tg = elapsed(lambda: df_g.sort("Last Name"))[1]
     result_row("sort(Last Name asc)", tp, tg)
     return tp, tg
 
 
-def bench_filter(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_filter(df_p: pl.DataFrame, df_g: gl.DataFrame):
     def polars_filter():
         return df_p.filter(pl.col("Index") > 50)
 
@@ -155,7 +155,7 @@ def bench_filter(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
     return tp, tg
 
 
-def bench_groupby(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_groupby(df_p: pl.DataFrame, df_g: gl.DataFrame):
     def polars_groupby():
         return (
             df_p.group_by("Country")
@@ -177,7 +177,7 @@ def bench_groupby(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
     return tp, tg
 
 
-def bench_aggregate(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_aggregate(df_p: pl.DataFrame, df_g: gl.DataFrame):
     def polars_agg():
         return df_p.select([
             pl.col("Index").mean().alias("mean"),
@@ -202,7 +202,7 @@ def bench_aggregate(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
     return tp, tg
 
 
-def bench_describe(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
+def bench_describe(df_p: pl.DataFrame, df_g: gl.DataFrame):
     tp = elapsed(lambda: df_p.describe())[1]
     tg = elapsed(lambda: df_g.describe())[1]
     result_row("describe", tp, tg)
@@ -210,8 +210,8 @@ def bench_describe(df_p: "pl.DataFrame", df_g: "grizzlars.DataFrame"):
 
 
 def bench_join_inner(
-    df_p_c: "pl.DataFrame",     df_p_p: "pl.DataFrame",
-    df_g_c: "grizzlars.DataFrame", df_g_p: "grizzlars.DataFrame",
+    df_p_c: pl.DataFrame,     df_p_p: pl.DataFrame,
+    df_g_c: gl.DataFrame, df_g_p: gl.DataFrame,
 ):
     """Inner join on Index — every customer row matches a people row."""
 
@@ -233,8 +233,8 @@ def bench_join_inner(
 
 
 def bench_join_left(
-    df_p_c: "pl.DataFrame",     df_p_p: "pl.DataFrame",
-    df_g_c: "grizzlars.DataFrame", df_g_p: "grizzlars.DataFrame",
+    df_p_c: pl.DataFrame,     df_p_p: pl.DataFrame,
+    df_g_c: gl.DataFrame, df_g_p: gl.DataFrame,
 ):
     """Left join: customers (100 000) LEFT JOIN people[first 50 000].
     The upper half of customers gets no match — exercises the null-fill path."""
@@ -324,7 +324,7 @@ def run_benchmark():
     df_g_people = load_people_grizzlars()
 
     # Customers also need Index as frame index for grizzlars join_by_index
-    df_g_c_idx = grizzlars.read_csv(str(CSV_PATH), index_col="Index")
+    df_g_c_idx = gl.read_csv(str(CSV_PATH), index_col="Index")
 
     bench_join_inner(df_p, df_p_people, df_g_c_idx, df_g_people)
     bench_join_left(df_p, df_p_people, df_g_c_idx, df_g_people)

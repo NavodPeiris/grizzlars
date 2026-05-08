@@ -1,9 +1,9 @@
-import grizzlars
+import grizzlars as gl
 
 
 def main() -> None:
     # Build a DataFrame from a dict — index auto-assigned 0..4
-    df = grizzlars.DataFrame(
+    df = gl.DataFrame(
         {
             "price":  [100.5, 200.0, 150.75, 300.0, 250.5],
             "volume": [1000,  2000,   1500,  3000,  2500],
@@ -37,7 +37,7 @@ def main() -> None:
 
     # Round-trip to CSV
     df.to_csv("output.csv")
-    df2 = grizzlars.read_csv("output.csv", index_col="index")
+    df2 = gl.read_csv("output.csv", index_col="index")
     print(f"\n── read back from CSV: {df2.shape[0]} rows, {df2.shape[1]} cols ──")
     print(df2.head())
 

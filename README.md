@@ -16,7 +16,7 @@
 
 > A Python DataFrame library backed by a multithreaded C++ engine — built for speed.
 
-grizzlars wraps [hmdf](https://github.com/hosseinmoein/DataFrame), a high-performance C++ DataFrame, with a clean Python API. Columns are stored as typed `std::vector<T>` buffers — no GIL-bound Python object overhead. Sort, filter, groupby, join, and aggregate operations run in parallel across all CPU cores automatically.
+grizzlars wraps [DataFrame](https://github.com/hosseinmoein/DataFrame), a high-performance C++ DataFrame, with a clean Python API. Columns are stored as typed `std::vector<T>` buffers — no GIL-bound Python object overhead. Sort, filter, groupby, join, and aggregate operations run in parallel across all CPU cores automatically.
 
 ---
 
@@ -33,18 +33,18 @@ pip install grizzlars
 ## Quick Start
 
 ```python
-import grizzlars
+import grizzlars as gl
 
-df = grizzlars.DataFrame({
-    "symbol": ["AAPL", "GOOGL", "MSFT", "AMZN", "META"],
-    "price":  [189.3,  175.1,   415.2,  185.0,  502.7],
-    "volume": [52_000_000, 18_000_000, 22_000_000, 31_000_000, 14_000_000],
-    "active": [True, True, True, False, True],
+df = gl.DataFrame({
+  "symbol": ["AAPL", "GOOGL", "MSFT", "AMZN", "META"],
+  "price":  [189.3,  175.1,   415.2,  185.0,  502.7],
+  "volume": [52_000_000, 18_000_000, 22_000_000, 31_000_000, 14_000_000],
+  "active": [True, True, True, False, True],
 })
 
 print(df)
 # Load from CSV
-df = grizzlars.read_csv("prices.csv")
+df = gl.read_csv("prices.csv")
 ```
 
 ---
@@ -71,13 +71,13 @@ The index is always `uint64` and defaults to `0..N-1`.
 Read a CSV file into a DataFrame. Uses a multithreaded native C++ reader by default.
 
 ```python
-df = grizzlars.read_csv("data.csv")
+df = gl.read_csv("data.csv")
 
 # Promote a column to the index
-df = grizzlars.read_csv("data.csv", index_col="Id")
+df = gl.read_csv("data.csv", index_col="Id")
 
 # Force a column to a specific type (triggers slower Python fallback)
-df = grizzlars.read_csv("data.csv", dtype={"code": str})
+df = gl.read_csv("data.csv", dtype={"code": str})
 ```
 
 #### `df.to_csv(path, index=True)`
@@ -98,13 +98,13 @@ df.to_csv("output.csv", index=False)  # omit index column
 Build a DataFrame from a dict of lists or NumPy arrays.
 
 ```python
-df = grizzlars.DataFrame({
-    "x": [1, 2, 3],
-    "y": [4.0, 5.0, 6.0],
+df = gl.DataFrame({
+  "x": [1, 2, 3],
+  "y": [4.0, 5.0, 6.0],
 })
 
 # Custom index
-df = grizzlars.DataFrame({"x": [10, 20, 30]}, index=[100, 200, 300])
+df = gl.DataFrame({"x": [10, 20, 30]}, index=[100, 200, 300])
 ```
 
 ---
@@ -274,8 +274,8 @@ GroupBy uses `string_view` keys internally — zero string copies during bucketi
 Joins operate on the DataFrame index. Load CSVs with `index_col=` to set the join key.
 
 ```python
-left  = grizzlars.read_csv("orders.csv",   index_col="order_id")
-right = grizzlars.read_csv("products.csv", index_col="order_id")
+left  = gl.read_csv("orders.csv",   index_col="order_id")
+right = gl.read_csv("products.csv", index_col="order_id")
 
 inner  = left.join(right, how="inner")   # default
 left_j = left.join(right, how="left")    # unmatched right → NaN / ""
@@ -364,11 +364,11 @@ grizzlars automatically enables multithreading on import using all logical CPU c
 You can adjust it at runtime.
 
 ```python
-import grizzlars
+import grizzlars as gl
 
-grizzlars.set_optimum_thread_level()   # auto-detect (called on import)
-grizzlars.set_thread_level(4)          # pin to 4 threads
-grizzlars.get_thread_level()           # returns current thread count
+gl.set_optimum_thread_level()   # auto-detect (called on import)
+gl.set_thread_level(4)          # pin to 4 threads
+gl.get_thread_level()           # returns current thread count
 ```
 
 ---
@@ -434,15 +434,15 @@ Full test result:
 
 ```
 grizzlars/
+├── DataFrame/             core C++ library
 ├── grizzlars/             Python package
 │   └── __init__.py        DataFrame class + read_csv
 ├── src/
 │   └── grizzlars_bindings.cpp   pybind11 C++ extension
-├── DataFrame/             hmdf C++ library (header-only + DateTime.cc)
 ├── tests/
-│   ├── text_benchmark_test.py    customer data benchmark
-│   ├── numeric_benchmark_test.py stock data benchmark
-│   └── mixed_benchmark_test.py   warehouse data benchmark
+│   ├── data               data for tests
+│   ├── functional         functional tests
+│   └── performance        performance tests
 ├── CMakeLists.txt
 └── pyproject.toml
 ```
