@@ -35,6 +35,18 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include<algorithm>
 
+// Compatibility: std::ranges::contains was added in C++23
+// Provide fallback for non-MSVC compilers that don't fully support C++23
+// MSVC already provides std::ranges::contains, so skip shim on MSVC
+#if !defined(_MSC_VER) && __cplusplus < 202302L
+namespace std::ranges {
+    template<typename Range, typename T>
+    inline bool contains(const Range& r, const T& value) {
+        return std::find(r.begin(), r.end(), value) != r.end();
+    }
+}
+#endif
+
 // ----------------------------------------------------------------------------
 
 namespace hmdf
