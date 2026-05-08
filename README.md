@@ -1,5 +1,15 @@
 # grizzlars
 
+<p align="center">
+    <a href="./LICENSE"><img src="https://img.shields.io/github/license/NavodPeiris/grizzlars"></a>
+    <a href="https://github.com/NavodPeiris/grizzlars/releases"><img src="https://img.shields.io/github/v/release/NavodPeiris/grizzlars?color=ffa"></a>
+    <a href="support os"><img src="https://img.shields.io/badge/os-linux%2C%20win%2C%20mac-pink.svg"></a>
+    <a href=""><img src="https://img.shields.io/badge/python-3.10+-aff.svg"></a>
+    <a href="https://github.com/NavodPeiris/grizzlars/issues"><img src="https://img.shields.io/github/issues/NavodPeiris/grizzlars?color=9cc"></a>
+    <a href="https://github.com/NavodPeiris/grizzlars/stargazers"><img src="https://img.shields.io/github/stars/NavodPeiris/grizzlars?color=ccf"></a>
+    <a href="https://pypi.org/project/grizzlars/"><img src="https://static.pepy.tech/badge/grizzlars"></a>
+</p>
+
 > A Python DataFrame library backed by a multithreaded C++ engine — built for speed.
 
 grizzlars wraps [hmdf](https://github.com/hosseinmoein/DataFrame), a high-performance C++ DataFrame, with a clean Python API. Columns are stored as typed `std::vector<T>` buffers — no GIL-bound Python object overhead. Sort, filter, groupby, join, and aggregate operations run in parallel across all CPU cores automatically.
