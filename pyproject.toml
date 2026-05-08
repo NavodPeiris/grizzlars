@@ -1,0 +1,83 @@
+[project]
+name = "grizzlars"
+version = "0.1.0"
+description = "High Performance DataFrame library written in C++ and wrapped with Python."
+readme = "README.md"
+requires-python = ">=3.10"
+
+authors = [
+    { name = "Navod Peiris", email = "navodpeiris1234@gmail.com" }
+]
+
+license = { text = "MIT" }
+
+keywords=[
+    "dataframe",
+    "pandas",
+    "polars",
+    "analytics",
+    "data-processing",
+    "etl",
+    "columnar",
+    "high-performance",
+    "cpp",
+    "python",
+    "fast-dataframe",
+    "big-data",
+    "vectorized",
+    "parallel-processing",
+    "tabular-data",
+]
+classifiers=[
+    "Development Status :: 3 - Alpha",
+
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+
+    "License :: OSI Approved :: MIT License",
+
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+
+    "Programming Language :: C++",
+
+    "Operating System :: OS Independent",
+
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "pybind11>=3.0.4",
+    "scikit-build-core>=0.12.2",
+]
+
+[dependency-groups]
+dev = [
+    "polars>=1.40.1",
+    "pytest>=9.0.3",
+]
+
+[build-system]
+requires = ["scikit-build-core>=0.3.3", "pybind11>=2.11"]
+build-backend = "scikit_build_core.build"
+
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["grizzlars"]
+
+[tool.scikit-build.cmake.define]
+CMAKE_CXX_STANDARD = "23"
+
+[project.urls]
+Homepage = "https://github.com/NavodPeiris/grizzlars"
+Repository = "https://github.com/NavodPeiris/grizzlars"
+Issues = "https://github.com/NavodPeiris/grizzlars/issues"
+Documentation = "https://github.com/NavodPeiris/grizzlars#readme"

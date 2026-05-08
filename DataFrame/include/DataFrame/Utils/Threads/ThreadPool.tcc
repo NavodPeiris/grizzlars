@@ -1,0 +1,531 @@
+// Hossein Moein
+// August 9, 2023
+/*
+Copyright (c) 2023-2028, Hossein Moein
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+* Redistributions of source code must retain the above copyright
+  notice, this list of conditions and the following disclaimer.
+* Redistributions in binary form must reproduce the above copyright
+  notice, this list of conditions and the following disclaimer in the
+  documentation and/or other materials provided with the distribution.
+* Neither the name of Hossein Moein and/or the DataFrame nor the
+  names of its contributors may be used to endorse or promote products
+  derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL Hossein Moein BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+#include <DataFrame/Utils/Threads/ThreadPool.h>
+
+#include <algorithm>
+
+// ----------------------------------------------------------------------------
+
+namespace hmdf
+{
+
+std::pair<typename ThreadPool::size_type, typename ThreadPool::size_type>
+inline
+ThreadPool::cline_aligned_blocks_(size_type data_size,
+                                  size_type num_blocks,
+                                  size_type divisor)  {
+
+    // Calculate base block size (divisible by divisor)
+    //
+    const size_type base_size { (data_size / num_blocks / divisor) * divisor };
+
+    // Calculate remainder
+    //
+    const size_type remainder { data_size - (base_size * num_blocks) };
+
+    return (std::make_pair(base_size, remainder));
+}
+
+// ----------------------------------------------------------------------------
+
+inline ThreadPool::ThreadPool(size_type thr_num)  {
+
+    threads_.reserve(thr_num * 2);
+    for (size_type i = 0; i < thr_num; ++i)  {
+        local_queues_.push_back(LocalQueueType { });
+        threads_.emplace_back(&ThreadPool::thread_routine_, this, i);
+    }
+
+    // Make sure all threads are running before we exit the constructor
+    //
+    while (capacity_threads() != thr_num)
+        std::this_thread::yield();
+}
+
+// ----------------------------------------------------------------------------
+
+inline ThreadPool::~ThreadPool()  {
+
+    shutdown();
+    for (auto &routine : threads_)
+        if (routine.joinable())
+            routine.join();
+}
+
+// ----------------------------------------------------------------------------
+
+inline bool
+ThreadPool::add_thread(size_type thr_num)  {
+
+    if (is_shutdown())
+        throw std::runtime_error("ThreadPool::add_thread(): "
+                                 "Thread pool is shutdown.");
+
+    if (thr_num < 0)  {
+        const size_type shutys { ::labs(thr_num) };
+
+        if (shutys > capacity_threads())  {
+            char    err[1024];
+
+            ::snprintf(err, sizeof(err) - 1,
+                       "ThreadPool::add_thread(): Cannot subtract "
+                       "'%ld' threads from the pool with capacity '%ld'",
+                       shutys, capacity_threads());
+            throw std::runtime_error(err);
+        }
+
+        for (size_type i = 0; i < shutys; ++i)  {
+            const WorkUnit  work_unit { WORK_TYPE::_terminate_ };
+
+            global_queue_.push(work_unit);
+        }
+    }
+    else if (thr_num > 0)  {
+        const guard_type    guard { state_ };
+        const size_type     local_size { size_type(threads_.size()) };
+
+        for (size_type i = 0; i < thr_num; ++i)  {
+            local_queues_.push_back(LocalQueueType { });
+            threads_.emplace_back(&ThreadPool::thread_routine_,
+                                  this, local_size + i);
+        }
+    }
+
+    std::this_thread::yield();  // Give +/- threads a chance
+    return (true);
+}
+
+// ----------------------------------------------------------------------------
+
+template<typename F, typename ... As>
+ThreadPool::dispatch_res_t<F, As ...>
+ThreadPool::dispatch(bool immediately, F &&routine, As && ... args)  {
+
+    if (is_shutdown() || (capacity_threads() == 0 && ! immediately))
+        throw std::runtime_error("ThreadPool::dispatch(): "
+                                 "Thread-pool has 0 thread capacity.");
+
+    using task_return_t =
+        std::invoke_result_t<std::decay_t<F>, std::decay_t<As> ...>;
+    using future_t = dispatch_res_t<F, As ...>;
+
+    auto            callable  {
+        std::make_shared<std::packaged_task<task_return_t()>>
+            (std::bind<task_return_t>(std::forward<F>(routine),
+                                      std::forward<As>(args) ...))
+    };
+    future_t        return_fut { callable->get_future() };
+    const WorkUnit  work_unit {
+        WORK_TYPE::_client_service_, [callable]() -> void { (*callable)(); }
+    };
+
+    if (immediately && available_threads() == 0)
+        add_thread(1);
+
+    if (local_queue_)  {  // Is this one of the pool threads
+        const guard_type    guard { state_ };
+
+        local_queue_->push(work_unit);
+    }
+    else
+        global_queue_.push(work_unit);
+
+    return (return_fut);
+}
+
+// ----------------------------------------------------------------------------
+
+template<typename T, typename F, typename I, typename ... As>
+ThreadPool::loop_res_t<F, I, As ...>
+ThreadPool::parallel_loop(I begin, I end, F &&routine, As && ... args)  {
+
+    using task_return_t =
+        std::invoke_result_t<std::decay_t<F>,
+                             std::decay_t<I>,
+                             std::decay_t<I>,
+                             std::decay_t<As> ...>;
+    using future_t = std::future<task_return_t>;
+
+    size_type   n { 0 };
+    bool        backward { false };
+
+    if constexpr (std::is_integral_v<I>)  {
+        if (begin > end)  {
+            n = begin - end;
+            backward = true;
+        }
+        else
+            n = end - begin;
+    }
+    else
+        n = std::distance(begin, end);
+
+    constexpr size_type     cline_divisor { CLINE_SIZE / long(sizeof(T)) };
+    const size_type         cap_thrs { capacity_threads() };
+    const auto              blocks {
+        cline_aligned_blocks_(n, cap_thrs - 1, cline_divisor)
+    };
+    std::vector<future_t>   ret;
+
+    ret.reserve(blocks.first > 0 ? cap_thrs : size_type(1));
+    if (blocks.first > 0)  {
+        if (backward)  {
+            for (size_type i = n; i >= 0; i -= blocks.first)  {
+                size_type   block_end { i - blocks.first };
+
+                if (size_type((end + i) - (end + block_end + 1)) <
+                        (blocks.first - 1))
+                    block_end = -1;
+                if (block_end < 0)  break;
+                ret.emplace_back(dispatch(false,
+                                          std::forward<F>(routine),
+                                              end + block_end,
+                                              end + i,
+                                              std::forward<As>(args) ...));
+            }
+        }
+        else  {
+            for (size_type i = 0; i < n; i += blocks.first)  {
+                size_type block_end { i + blocks.first };
+
+                if (block_end > n)  break;
+                ret.emplace_back(dispatch(false,
+                                          std::forward<F>(routine),
+                                              begin + i,
+                                              begin + block_end,
+                                              std::forward<As>(args) ...));
+            }
+        }
+    }
+    if (blocks.second > 0)  {
+        if (backward)
+            ret.emplace_back(dispatch(false,
+                                      std::forward<F>(routine),
+                                          end,
+                                          end + blocks.second,
+                                          std::forward<As>(args) ...));
+        else
+            ret.emplace_back(dispatch(
+                false,
+                std::forward<F>(routine),
+                    begin + (blocks.first * (cap_thrs - 1)),
+                    end,
+                    std::forward<As>(args) ...));
+    }
+
+    return (ret);
+}
+
+// ----------------------------------------------------------------------------
+
+template<typename T, typename F, typename I1, typename I2, typename ... As>
+ThreadPool::loop2_res_t<F, I1, I2, As ...>
+ThreadPool::parallel_loop2(I1 begin1, I1 end1, I2 begin2, I2 end2,
+                           F &&routine, As && ... args)  {
+
+    using task_return_t =
+        std::invoke_result_t<std::decay_t<F>,
+                             std::decay_t<I1>,
+                             std::decay_t<I1>,
+                             std::decay_t<I2>,
+                             std::decay_t<As> ...>;
+    using future_t = std::future<task_return_t>;
+
+    size_type   n { 0 };
+
+    if constexpr (std::is_integral_v<I1>)
+        n = std::min(end1 - begin1, end2 - begin2);
+    else
+        n = std::min(std::distance(begin1, end1), std::distance(begin2, end2));
+
+    constexpr size_type     cline_divisor { CLINE_SIZE / long(sizeof(T)) };
+    const size_type         cap_thrs { capacity_threads() };
+    const auto              blocks {
+        cline_aligned_blocks_(n, cap_thrs - 1, cline_divisor)
+    };
+    std::vector<future_t>   ret;
+
+    ret.reserve(blocks.first > 0 ? cap_thrs : size_type(1));
+    if (blocks.first > 0)  {
+        for (size_type i = 0; i < n; i += blocks.first)  {
+            size_type block_end { i + blocks.first };
+
+            if (block_end > n)  break;
+            ret.emplace_back(dispatch(false,
+                                      std::forward<F>(routine),
+                                          begin1 + i,
+                                          begin1 + block_end,
+                                          begin2 + i,
+                                          std::forward<As>(args) ...));
+        }
+    }
+    if (blocks.second > 0)  {
+        ret.emplace_back(dispatch(false,
+                                  std::forward<F>(routine),
+                                      begin1 + (blocks.first * (cap_thrs - 1)),
+                                      begin1 + n,
+                                      begin2 + (blocks.first * (cap_thrs - 1)),
+                                      std::forward<As>(args) ...));
+    }
+
+    return (ret);
+}
+
+// ----------------------------------------------------------------------------
+
+template<std::random_access_iterator I, long TH>
+void
+ThreadPool::parallel_sort(const I begin, const I end)  {
+
+    using value_type = typename std::iterator_traits<I>::value_type;
+
+    auto    compare = std::less<value_type>{ };
+
+    parallel_sort<I, decltype(compare), TH>(begin, end, std::move(compare));
+}
+
+// ----------------------------------------------------------------------------
+
+template<std::random_access_iterator I, typename P>
+static inline I
+_median_of_three_(I begin, I mid, I last, P &compare)  {
+
+    if (compare(*mid, *begin))  std::iter_swap(begin, mid);
+    if (compare(*last, *mid))  std::iter_swap(mid, last);
+    if (compare(*mid, *begin))  std::iter_swap(begin, mid);
+    return (mid); // *begin <= *mid <= *last under compare
+}
+
+// --------------------------------------
+
+template<std::random_access_iterator I, typename P, long TH>
+void
+ThreadPool::parallel_sort(const I begin, const I end, P compare)  {
+
+    if (begin >= end) return;
+
+    const size_type data_size = std::distance(begin, end);
+
+    if (data_size <= TH)  {
+        std::sort(begin, end, compare);
+        return;
+    }
+
+    // Pivot selection (median‑of‑three)
+    //
+    auto        mid = begin + (data_size / 2);
+    auto        pivot_it = _median_of_three_(begin, mid, end - 1, compare);
+    const auto  pivot = *pivot_it;
+
+    std::iter_swap(pivot_it, end - 1);  // Move pivot to end ‑ 1
+
+    auto    cut =
+        std::ranges::partition(begin, end - 1,
+                               [&pivot, &compare](const auto &x) -> bool {
+                                   return (compare(x, pivot));
+                               });
+
+    std::iter_swap(cut.begin(), end - 1);  // Restore pivot
+
+    auto    lf = dispatch(false,
+                          &ThreadPool::parallel_sort<I, P, TH>,
+                          this,
+                          begin,
+                          cut.begin(),
+                          compare);
+    auto    rf = dispatch(false,
+                          &ThreadPool::parallel_sort<I, P, TH>,
+                          this,
+                          cut.begin() + 1,
+                          end,
+                          compare);
+
+    while (lf.wait_for(std::chrono::seconds(0)) == std::future_status::timeout)
+        run_task();
+    while (rf.wait_for(std::chrono::seconds(0)) == std::future_status::timeout)
+        run_task();
+}
+
+// ----------------------------------------------------------------------------
+
+inline ThreadPool::size_type
+ThreadPool::available_threads() const noexcept  {
+
+    return (available_threads_.load(std::memory_order_relaxed));
+}
+
+// ----------------------------------------------------------------------------
+
+inline ThreadPool::size_type
+ThreadPool::capacity_threads() const noexcept  {
+
+    return (capacity_threads_.load(std::memory_order_relaxed));
+}
+
+// ----------------------------------------------------------------------------
+
+inline bool
+ThreadPool::is_shutdown() const noexcept  {
+
+    return (shutdown_flag_.load(std::memory_order_relaxed));
+}
+
+// ----------------------------------------------------------------------------
+
+inline ThreadPool::size_type
+ThreadPool::pending_tasks() const noexcept  {
+
+    return (global_queue_.size());
+}
+
+// ----------------------------------------------------------------------------
+
+inline bool
+ThreadPool::shutdown() noexcept  {
+
+    bool    expected { false };
+
+    if (shutdown_flag_.compare_exchange_strong(expected, true,
+                                               std::memory_order_relaxed,
+                                               std::memory_order_relaxed))  {
+        const size_type capacity { capacity_threads() + 10 };
+
+        for (size_type i = 0; i < capacity; ++i)  {
+            const WorkUnit  work_unit { WORK_TYPE::_terminate_ };
+
+            global_queue_.push(work_unit);
+        }
+    }
+
+    return (true);
+}
+
+// ----------------------------------------------------------------------------
+
+inline ThreadPool::WorkUnit
+ThreadPool::get_one_local_task_() noexcept  {
+
+    WorkUnit            work_unit;
+    const guard_type    guard { state_ };
+
+    if (local_queue_ && (! local_queue_->empty()))  {
+        work_unit = local_queue_->front();
+        local_queue_->pop();
+    }
+    else  {  // Try to steal tasks from other queues
+        for (auto &q : local_queues_)
+            if (! q.empty())  {
+                work_unit = q.front();
+                q.pop();
+                break;
+            }
+    }
+    return (work_unit);
+}
+
+// ----------------------------------------------------------------------------
+
+inline bool
+ThreadPool::run_task() noexcept  {
+
+    WorkUnit    work_unit = get_one_local_task_();
+
+    if (work_unit.work_type == WORK_TYPE::_undefined_)  {
+        const auto  opt_ret = global_queue_.pop_front(false); // Don't wait
+
+        if (opt_ret.has_value())
+            work_unit = opt_ret.value();
+    }
+    if (work_unit.work_type == WORK_TYPE::_client_service_) {
+        (work_unit.func)();  // Execute the callable
+        return (true);
+    }
+    else if (work_unit.work_type != WORK_TYPE::_undefined_)
+        global_queue_.push(work_unit);  // Put it back
+    return (false);
+}
+
+// ----------------------------------------------------------------------------
+
+inline bool
+ThreadPool::thread_routine_(size_type local_q_idx) noexcept  {
+
+    if (is_shutdown())
+        return (false);
+
+    auto    iter = local_queues_.begin();
+
+    std::advance(iter, local_q_idx);
+    local_queue_ = &(*iter);
+    ++capacity_threads_;
+    while (true)  {
+        ++available_threads_;
+
+        // Spin-poll for up to 79 iterations to service tasks with low
+        // latency.  Break early once 16 consecutive polls find nothing —
+        // that indicates the pool is idle and burning CPU is pointless.
+        size_type   counter { 0 };
+        size_type   idle_spins { 0 };
+
+        while (++counter < 80)  {
+            if (run_task())
+                idle_spins = 0;
+            else if (++idle_spins > 16)
+                break;
+        }
+
+        WorkUnit    work_unit { };
+        const auto  opt_ret = global_queue_.pop_front(true); // Wait
+
+        if (opt_ret.has_value())
+            work_unit = opt_ret.value();
+
+        --available_threads_;
+
+        if (work_unit.work_type == WORK_TYPE::_client_service_)
+            (work_unit.func)();  // Execute the callable
+        else if (work_unit.work_type == WORK_TYPE::_terminate_)
+            break;
+    }
+    --capacity_threads_;
+    local_queue_ = nullptr;
+
+    return (true);
+}
+
+} // namespace hmdf
+
+// ----------------------------------------------------------------------------
+
+// Local Variables:
+// mode:C++
+// tab-width:4
+// c-basic-offset:4
+// End:
