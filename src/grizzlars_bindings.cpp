@@ -17,25 +17,25 @@
 #include <cstdlib>
 #include <cstring>
 #if defined(__has_include)
-#  if __has_include(<execution>)
-#    include <execution>
-#    if defined(__cpp_lib_execution)
-#      define GRIZZLAR_USE_EXECUTION 1
-#    endif
-#  endif
+#if __has_include(<execution>)
+#include <execution>
+#if defined(__cpp_lib_execution)
+#define GRIZZLAR_USE_EXECUTION 1
+#endif
+#endif
 #endif
 
 // Execution policy compatibility layer
 #if defined(GRIZZLAR_USE_EXECUTION)
-    // Prefer parallel where available; AppleClang's implementation was limited
-#  ifdef __APPLE__
-#    define GRIZZLAR_EXEC_POLICY std::execution::seq
-#  else
-#    define GRIZZLAR_EXEC_POLICY std::execution::par
-#  endif
-#  define GRIZZLAR_SORT(policy, ...) std::sort(policy, __VA_ARGS__)
+// Prefer parallel where available; AppleClang's implementation was limited
+#ifdef __APPLE__
+#define GRIZZLAR_EXEC_POLICY std::execution::seq
 #else
-#  define GRIZZLAR_SORT(policy, ...) std::sort(__VA_ARGS__)
+#define GRIZZLAR_EXEC_POLICY std::execution::par
+#endif
+#define GRIZZLAR_SORT(policy, ...) std::sort(policy, __VA_ARGS__)
+#else
+#define GRIZZLAR_SORT(policy, ...) std::sort(__VA_ARGS__)
 #endif
 #include <fstream>
 #include <future>
@@ -1635,36 +1635,36 @@ public:
                 keys[i] = raw[i];
             if (ascending)
                 GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                             [&](size_t a, size_t b)
-                             { return keys[a] < keys[b]; });
+                              [&](size_t a, size_t b)
+                              { return keys[a] < keys[b]; });
             else
                 GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                             [&](size_t a, size_t b)
-                             { return keys[a] > keys[b]; });
+                              [&](size_t a, size_t b)
+                              { return keys[a] > keys[b]; });
         }
         else if (type == "int64")
         {
             const auto &keys = df_.get_column<int64_t>(col.c_str());
             if (ascending)
                 GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                             [&](size_t a, size_t b)
-                             { return keys[a] < keys[b]; });
+                              [&](size_t a, size_t b)
+                              { return keys[a] < keys[b]; });
             else
                 GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                             [&](size_t a, size_t b)
-                             { return keys[a] > keys[b]; });
+                              [&](size_t a, size_t b)
+                              { return keys[a] > keys[b]; });
         }
         else if (type == "double")
         {
             const auto &keys = df_.get_column<double>(col.c_str());
             if (ascending)
                 GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                             [&](size_t a, size_t b)
-                             { return keys[a] < keys[b]; });
+                              [&](size_t a, size_t b)
+                              { return keys[a] < keys[b]; });
             else
                 GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                             [&](size_t a, size_t b)
-                             { return keys[a] > keys[b]; });
+                              [&](size_t a, size_t b)
+                              { return keys[a] > keys[b]; });
         }
         else
         {
@@ -1682,12 +1682,12 @@ public:
         const auto &idx = df_.get_index();
         if (ascending)
             GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                         [&](size_t a, size_t b)
-                         { return idx[a] < idx[b]; });
+                          [&](size_t a, size_t b)
+                          { return idx[a] < idx[b]; });
         else
             GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                         [&](size_t a, size_t b)
-                         { return idx[a] > idx[b]; });
+                          [&](size_t a, size_t b)
+                          { return idx[a] > idx[b]; });
         return extract_rows_parallel(perm);
     }
 

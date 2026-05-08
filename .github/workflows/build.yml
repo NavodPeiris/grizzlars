@@ -36,7 +36,12 @@ jobs:
 
           # PORTABLE_BUILD strips -march=native so the wheel runs on any
           # x86-64 or arm64 CPU, not just the specific build machine
-          CIBW_CMAKE_ARGS: "-DPORTABLE_BUILD=ON"
+          # Ensure created extension uses a relative rpath so auditwheel/delocate
+          # can find and bundle TBB into the wheel at repair time.
+          CIBW_CMAKE_ARGS: "-DPORTABLE_BUILD=ON -DCMAKE_INSTALL_RPATH='\\$ORIGIN/.libs'"
+          # Use a recent macOS deployment target to match brewed TBB binaries
+          # (adjust if you need wider macOS compatibility).
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
 
           # Smoke-test every wheel before it is uploaded
           CIBW_TEST_REQUIRES: numpy
