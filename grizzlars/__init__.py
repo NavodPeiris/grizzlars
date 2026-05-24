@@ -849,7 +849,8 @@ class DataFrame:
         cols = self.columns
         if not cols:
             return np.empty((len(self), 0))
-        arrays = [np.asarray(list(self[c])) for c in cols]
+        # get_column returns a numpy array for numeric types — no list round-trip needed
+        arrays = [np.asarray(self._frame.get_column(c)) for c in cols]
         dtypes_set = {a.dtype.kind for a in arrays}
         if len(dtypes_set) == 1 and dtypes_set <= {"f", "i", "u"}:
             return np.column_stack(arrays)
