@@ -46,7 +46,7 @@ except ImportError:
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 
-CSV_PATH    = Path(__file__).parent.parent / "data" / "customers-100000.csv"
+CSV_PATH    = Path(__file__).parent.parent / "data" / "big_data" / "customers-2000000.csv"
 PEOPLE_PATH = Path(__file__).parent.parent / "data" / "people-100000.csv"
 
 # Columns pulled from people that don't clash with customers columns.

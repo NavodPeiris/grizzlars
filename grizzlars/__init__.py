@@ -18,6 +18,7 @@ import math as _math
 import operator as _op
 import random as _random
 import re
+import sys as _sys
 from typing import Any, Callable, Optional, Union
 
 from ._grizzlars import (
@@ -55,108 +56,219 @@ def _display(v) -> str:
     return "NaN" if _is_nan(v) or v == "" else str(v)
 
 
+# ── _ColComparison ─────────────────────────────────────────────────────────────
+
+class _ColComparison:
+    """
+    Lazy column comparison returned by Series.__gt__ / __lt__ etc. when the
+    Series has a tracked source DataFrame and column name.
+
+    Passed to DataFrame.filter() it triggers the fast C++ filter_col_scalar()
+    path — no Python per-row loop needed.
+
+    Combining two _ColComparisons with & or | falls back to materialized masks.
+    """
+
+    __slots__ = ("_df", "_col", "_op", "_scalar")
+
+    def __init__(self, df, col: str, op: str, scalar) -> None:
+        self._df     = df
+        self._col    = col
+        self._op     = op   # ">", ">=", "<", "<=", "==", "!="
+        self._scalar = scalar
+
+    def to_mask(self) -> list:
+        """Materialize to a bool list via C++ compare_col_scalar (if available)."""
+        try:
+            return self._df._frame.compare_col_scalar(self._col, self._op, float(self._scalar))
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pass
+        fn = _OPS[self._op]
+        raw = self._df._frame.get_column(self._col)
+        return [fn(v, self._scalar) if not (_is_nan(v) if isinstance(v, float) else False)
+                else False for v in raw]
+
+    def __and__(self, other):
+        if isinstance(other, _ColComparison):
+            return _CombinedComparison(self, other, "and")
+        return NotImplemented
+
+    def __or__(self, other):
+        if isinstance(other, _ColComparison):
+            return _CombinedComparison(self, other, "or")
+        return NotImplemented
+
+    def __invert__(self):
+        inv = {">" : "<=", ">=" : "<", "<" : ">=", "<=" : ">", "==" : "!=", "!=" : "=="}
+        return _ColComparison(self._df, self._col, inv[self._op], self._scalar)
+
+    # bool() forces materialization (needed when used as a bool mask list)
+    def __iter__(self):
+        return iter(self.to_mask())
+
+    def __len__(self):
+        return len(self._df)
+
+
+class _CombinedComparison:
+    """Lazy AND / OR of two _ColComparison objects."""
+
+    __slots__ = ("_left", "_right", "_logic")
+
+    def __init__(self, left, right, logic: str) -> None:
+        self._left  = left
+        self._right = right
+        self._logic = logic  # "and" | "or"
+
+    def to_mask(self) -> list:
+        lm = self._left.to_mask()
+        rm = self._right.to_mask()
+        if self._logic == "and":
+            return [a and b for a, b in zip(lm, rm)]
+        return [a or b for a, b in zip(lm, rm)]
+
+    def __and__(self, other):
+        return _CombinedComparison(self, other, "and")
+
+    def __or__(self, other):
+        return _CombinedComparison(self, other, "or")
+
+    def __iter__(self):
+        return iter(self.to_mask())
+
+    def __len__(self):
+        return len(self._left)
+
+
 # ── Series ────────────────────────────────────────────────────────────────────
 
 class Series:
     """Lightweight 1-D column returned by DataFrame.__getitem__. No numpy/pandas dependency."""
 
-    def __init__(self, data, name=None, dtype=None):
-        # data may be a list or a numpy array; normalize to list
-        if isinstance(data, list):
+    def __init__(self, data, name=None, dtype=None, _src_frame=None, _src_col=None):
+        # Lazy mode: data is None, loaded on first access via _get_data()
+        if data is None:
+            self._data    = None
+            self._src_frame = _src_frame
+            self._src_col   = _src_col
+        elif isinstance(data, list):
             self._data = data
+            self._src_frame = None
+            self._src_col   = None
         else:
             try:
                 self._data = list(data)
             except TypeError:
                 self._data = [data]
+            self._src_frame = None
+            self._src_col   = None
         self.name = name
         self._dtype_str = dtype  # "double"/"int64"/"bool"/"string"
 
-    # Support len(), iteration, indexing
-    def __len__(self): return len(self._data)
-    def __iter__(self): return iter(self._data)
-    def __getitem__(self, i): return self._data[i]
+    def _get_data(self) -> list:
+        if self._data is None:
+            self._data = self._src_frame._frame.get_column(self._src_col)
+            if not isinstance(self._data, list):
+                self._data = list(self._data)
+        return self._data
 
-    # Element-wise comparisons → bool Series
+    # Support len(), iteration, indexing
+    def __len__(self):
+        if self._data is None and self._src_frame is not None:
+            return len(self._src_frame)
+        return len(self._data)
+    def __iter__(self): return iter(self._get_data())
+    def __getitem__(self, i): return self._get_data()[i]
+
+    # Element-wise comparisons — fast path when we have a source frame
+    def _cmp(self, other, op: str):
+        if self._src_frame is not None and self._src_col is not None and not isinstance(other, Series):
+            return _ColComparison(self._src_frame, self._src_col, op, other)
+        data = self._get_data()
+        fn = _OPS[op]
+        return Series([fn(v, other) if not (_is_nan(v) if isinstance(v, float) else False)
+                       else False for v in data], dtype="bool")
+
     def __eq__(self, other):
-        return Series([v == other for v in self._data], dtype="bool")
+        if self._src_frame is not None and self._src_col is not None and not isinstance(other, Series):
+            return _ColComparison(self._src_frame, self._src_col, "==", other)
+        data = self._get_data()
+        return Series([v == other for v in data], dtype="bool")
     def __ne__(self, other):
-        return Series([v != other for v in self._data], dtype="bool")
-    def __lt__(self, other):
-        return Series([
-            (v < other) if not (_is_nan(v) if isinstance(v, float) else False) else False
-            for v in self._data], dtype="bool")
-    def __le__(self, other):
-        return Series([
-            (v <= other) if not (_is_nan(v) if isinstance(v, float) else False) else False
-            for v in self._data], dtype="bool")
-    def __gt__(self, other):
-        return Series([
-            (v > other) if not (_is_nan(v) if isinstance(v, float) else False) else False
-            for v in self._data], dtype="bool")
-    def __ge__(self, other):
-        return Series([
-            (v >= other) if not (_is_nan(v) if isinstance(v, float) else False) else False
-            for v in self._data], dtype="bool")
+        if self._src_frame is not None and self._src_col is not None and not isinstance(other, Series):
+            return _ColComparison(self._src_frame, self._src_col, "!=", other)
+        data = self._get_data()
+        return Series([v != other for v in data], dtype="bool")
+    def __lt__(self, other): return self._cmp(other, "<")
+    def __le__(self, other): return self._cmp(other, "<=")
+    def __gt__(self, other): return self._cmp(other, ">")
+    def __ge__(self, other): return self._cmp(other, ">=")
 
     # Logical operators on bool Series
     def __and__(self, other):
-        return Series([a and b for a, b in zip(self._data, other._data)], dtype="bool")
+        if isinstance(other, (_ColComparison, _CombinedComparison)):
+            return _CombinedComparison(self, other, "and")
+        return Series([a and b for a, b in zip(self._get_data(), other._get_data())], dtype="bool")
     def __or__(self, other):
-        return Series([a or b for a, b in zip(self._data, other._data)], dtype="bool")
+        if isinstance(other, (_ColComparison, _CombinedComparison)):
+            return _CombinedComparison(self, other, "or")
+        return Series([a or b for a, b in zip(self._get_data(), other._get_data())], dtype="bool")
     def __invert__(self):
-        return Series([not v for v in self._data], dtype="bool")
+        return Series([not v for v in self._get_data()], dtype="bool")
 
     @property
     def dtype(self): return self._dtype_str
 
     def unique(self):
         seen = set(); result = []
-        for v in self._data:
+        for v in self._get_data():
             if v not in seen:
                 seen.add(v); result.append(v)
         return result
 
     def value_counts(self):
         from collections import Counter
-        c = Counter(v for v in self._data if not (_is_nan(v) if isinstance(v, float) else False))
+        c = Counter(v for v in self._get_data() if not (_is_nan(v) if isinstance(v, float) else False))
         return dict(sorted(c.items(), key=lambda x: -x[1]))
 
-    def to_list(self): return self._data.copy()
+    def to_list(self): return list(self._get_data())
 
     def to_numpy(self):
         import numpy as np
-        return np.asarray(self._data)
+        return np.asarray(self._get_data())
 
     def __array__(self, dtype=None):
         import numpy as np
-        return np.asarray(self._data, dtype=dtype)
+        return np.asarray(self._get_data(), dtype=dtype)
 
     def isnull(self):
-        return Series([_is_nan(v) or v == "" for v in self._data], dtype="bool")
+        return Series([_is_nan(v) or v == "" for v in self._get_data()], dtype="bool")
 
     def notnull(self):
-        return Series([not (_is_nan(v) or v == "") for v in self._data], dtype="bool")
+        return Series([not (_is_nan(v) or v == "") for v in self._get_data()], dtype="bool")
 
     def nunique(self):
-        return len(set(v for v in self._data
+        return len(set(v for v in self._get_data()
                        if not (_is_nan(v) if isinstance(v, float) else v == "")))
 
     def head(self, n: int = 5) -> "Series":
-        return Series(self._data[:n], name=self.name, dtype=self._dtype_str)
+        return Series(self._get_data()[:n], name=self.name, dtype=self._dtype_str)
 
     def tail(self, n: int = 5) -> "Series":
-        return Series(self._data[-n:] if n else [], name=self.name, dtype=self._dtype_str)
+        d = self._get_data()
+        return Series(d[-n:] if n else [], name=self.name, dtype=self._dtype_str)
 
     def take(self, indices, axis=0) -> "Series":
-        sz = len(self._data)
+        d = self._get_data()
+        sz = len(d)
         norm = [int(i) if i >= 0 else sz + int(i) for i in indices]
-        return Series([self._data[i] for i in norm], name=self.name, dtype=self._dtype_str)
+        return Series([d[i] for i in norm], name=self.name, dtype=self._dtype_str)
 
     def __repr__(self):
-        lines = [f"{i}    {v}" for i, v in enumerate(self._data[:10])]
-        if len(self._data) > 10:
-            lines.append(f"... {len(self._data) - 10} more")
+        d = self._get_data()
+        lines = [f"{i}    {v}" for i, v in enumerate(d[:10])]
+        if len(d) > 10:
+            lines.append(f"... {len(d) - 10} more")
         if self.name:
             lines.append(f"Name: {self.name}")
         return "\n".join(lines)
@@ -178,8 +290,10 @@ class _LazyFilterFrame:
     def __init__(self, source: "DataFrame", mask) -> None:
         object.__setattr__(self, "_source", source)
         object.__setattr__(self, "_mask",   mask)
-        # count True values without numpy
-        if isinstance(mask, (list, Series)):
+        # count True values without numpy; defer for lazy comparisons
+        if isinstance(mask, (_ColComparison, _CombinedComparison)):
+            cached_len = -1  # unknown until materialized
+        elif isinstance(mask, (list, Series)):
             cached_len = sum(1 for v in mask if v)
         else:
             try:
@@ -197,7 +311,10 @@ class _LazyFilterFrame:
         if r is None:
             source = object.__getattribute__(self, "_source")
             mask   = object.__getattribute__(self, "_mask")
-            if isinstance(mask, (list, Series)):
+            if isinstance(mask, (_ColComparison, _CombinedComparison)):
+                mask_list = mask.to_mask()
+                r = DataFrame._from_frame(source._frame.filter_by_mask_list(mask_list))
+            elif isinstance(mask, (list, Series)):
                 mask_list = list(mask)
                 r = DataFrame._from_frame(source._frame.filter_by_mask_list(mask_list))
             else:
@@ -208,11 +325,15 @@ class _LazyFilterFrame:
     # ── cheap operations (no materialization) ─────────────────────────────────
 
     def __len__(self) -> int:
-        return object.__getattribute__(self, "_cached_len")
+        n = object.__getattribute__(self, "_cached_len")
+        if n < 0:
+            n = len(self._realize())
+            object.__setattr__(self, "_cached_len", n)
+        return n
 
     @property
     def shape(self) -> tuple:
-        n   = object.__getattribute__(self, "_cached_len")
+        n   = len(self)
         src = object.__getattribute__(self, "_source")
         return (n, len(src.columns))
 
@@ -525,26 +646,31 @@ class DataFrame:
     # ── column access ─────────────────────────────────────────────────────────
 
     def __getitem__(self, key):
+        # _ColComparison / _CombinedComparison → fast C++ filter
+        if isinstance(key, _ColComparison):
+            try:
+                return DataFrame._from_frame(
+                    self._frame.filter_col_scalar(key._col, key._op, float(key._scalar))
+                )
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                pass
+            return DataFrame._from_frame(self._frame.filter_by_mask_list(key.to_mask()))
+        if isinstance(key, _CombinedComparison):
+            return DataFrame._from_frame(self._frame.filter_by_mask_list(key.to_mask()))
         # Boolean Series → row filter (no numpy needed)
         if isinstance(key, Series) and key.dtype == "bool":
             return DataFrame._from_frame(self._frame.filter_by_mask_list(key.to_list()))
         # Plain bool list → row filter
         if isinstance(key, list) and key and isinstance(key[0], bool):
             return DataFrame._from_frame(self._frame.filter_by_mask_list(key))
-        # numpy array support (optional)
-        try:
-            import numpy as np
-            if isinstance(key, np.ndarray) and (key.dtype == bool or key.dtype == np.bool_):
-                return DataFrame._from_frame(self._frame.filter_by_mask(key))
-        except ImportError:
-            pass
-        # pandas Series support (optional)
-        try:
-            import pandas as _pd
-            if isinstance(key, _pd.Series) and (str(key.dtype) in ("bool", "boolean")):
-                return DataFrame._from_frame(self._frame.filter_by_mask(key.to_numpy()))
-        except ImportError:
-            pass
+        # numpy array support (optional) — use sys.modules to avoid slow cold import
+        _np = _sys.modules.get("numpy")
+        if _np is not None and isinstance(key, _np.ndarray) and (key.dtype == bool or key.dtype == _np.bool_):
+            return DataFrame._from_frame(self._frame.filter_by_mask(key))
+        # pandas Series support (optional) — use sys.modules to avoid slow cold import
+        _pd = _sys.modules.get("pandas")
+        if _pd is not None and isinstance(key, _pd.Series) and (str(key.dtype) in ("bool", "boolean")):
+            return DataFrame._from_frame(self._frame.filter_by_mask(key.to_numpy()))
         # Slice → row range
         if isinstance(key, slice):
             total = len(self)
@@ -556,12 +682,11 @@ class DataFrame:
         # List of column names → sub-DataFrame
         if isinstance(key, list) and key and isinstance(key[0], str):
             return DataFrame._from_frame(self._frame.select_columns(key))
-        # String column name → Series
+        # String column name → lazy Series (data loaded on first access)
         if isinstance(key, str):
-            result = self._frame.get_column(key)
             dtype = self._frame.col_type(key)
-            data = result if isinstance(result, list) else list(result)
-            return Series(data, name=key, dtype=dtype)
+            return Series(None, name=key, dtype=dtype,
+                          _src_frame=self, _src_col=key)
         raise TypeError(
             f"DataFrame key must be a column name (str) or boolean array/Series, "
             f"got {type(key).__name__}"
@@ -790,6 +915,20 @@ class DataFrame:
         return [c for c in self.columns
                 if self._frame.col_type(c) in ("double", "int64", "bool")]
 
+    def multi_stats(self, col: str) -> dict:
+        """Compute count/mean/std/min/max/sum in a single C++ pass (fastest)."""
+        try:
+            return dict(self._frame.multi_stat_col(col))
+        except AttributeError:
+            return {
+                "count": self._frame.count(col),
+                "mean":  self._frame.mean(col),
+                "std":   self._frame.std(col),
+                "min":   self._frame.min(col),
+                "max":   self._frame.max(col),
+                "sum":   self._frame.sum(col),
+            }
+
     def sum(self, col: Optional[str] = None):
         """Sum of column values. No col → one-row DataFrame of all numeric columns."""
         if col is not None:
@@ -976,28 +1115,15 @@ class DataFrame:
         stat_names = ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
         data: dict = {"statistic": stat_names}
         for col, d in stats.items():
-            raw = [float(v) for v in self[col] if not (_is_nan(v) if isinstance(v, float) else False)]
-            n = len(raw)
-            mean_v = sum(raw) / n if n else float("nan")
-            def _percentile(sorted_v, p):
-                if not sorted_v: return float("nan")
-                pos = p / 100.0 * (len(sorted_v) - 1)
-                lo = int(pos)
-                frac = pos - lo
-                if lo + 1 < len(sorted_v):
-                    return sorted_v[lo] + frac * (sorted_v[lo+1] - sorted_v[lo])
-                return sorted_v[lo]
-            sv = sorted(raw)
-            std_v = _math.sqrt(sum((v - mean_v)**2 for v in raw) / (n - 1)) if n > 1 else 0.0
             data[col] = [
-                float(d.get("count", n)),
-                float(d.get("mean", mean_v)),
-                float(d.get("std", std_v)),
-                float(d.get("min", sv[0] if sv else float("nan"))),
-                _percentile(sv, 25),
-                _percentile(sv, 50),
-                _percentile(sv, 75),
-                float(d.get("max", sv[-1] if sv else float("nan"))),
+                float(d["count"]),
+                float(d["mean"]),
+                float(d["std"]),
+                float(d["min"]),
+                float(d["25%"]),
+                float(d["50%"]),
+                float(d["75%"]),
+                float(d["max"]),
             ]
         return DataFrame(data, index=list(range(len(stat_names))))
 
@@ -1192,6 +1318,18 @@ class DataFrame:
         """
         if op is None:
             mask = col_or_mask
+            # Fast path: _ColComparison → single C++ call (no Python loop)
+            if isinstance(mask, _ColComparison):
+                try:
+                    return DataFrame._from_frame(
+                        self._frame.filter_col_scalar(mask._col, mask._op, float(mask._scalar))
+                    )
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    pass
+                return _LazyFilterFrame(self, mask.to_mask())
+            # Combined comparison: materialize via to_mask()
+            if isinstance(mask, _CombinedComparison):
+                return _LazyFilterFrame(self, mask.to_mask())
             # Series or list of bools: use as-is
             if isinstance(mask, (Series, list)):
                 return _LazyFilterFrame(self, mask)
@@ -1206,6 +1344,13 @@ class DataFrame:
         else:
             if op not in _OPS:
                 raise ValueError(f"Unknown operator {op!r}. Choose from {list(_OPS)}")
+            # Fast C++ path for col+op+scalar
+            try:
+                return DataFrame._from_frame(
+                    self._frame.filter_col_scalar(col_or_mask, op, float(value))
+                )
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                pass
             raw = list(self[col_or_mask])
             fn = _OPS[op]
             mask = [fn(v, value) for v in raw]
@@ -1313,8 +1458,9 @@ class DataFrame:
         """Iterate over (index_label, row_dict) pairs."""
         idx = list(self.index)
         cols = self.columns
+        col_data = {col: self._frame.get_column(col) for col in cols}
         for i in range(len(self)):
-            row = {col: self[col][i] for col in cols}
+            row = {col: col_data[col][i] for col in cols}
             yield int(idx[i]), row
 
     def itertuples(self, index: bool = True, name: str = "Pandas"):
@@ -1325,8 +1471,9 @@ class DataFrame:
         fields = (["Index"] + safe_cols) if index else safe_cols
         Row = namedtuple(name or "Row", fields)
         idx = list(self.index)
+        col_data = {col: self._frame.get_column(col) for col in cols}
         for i in range(len(self)):
-            vals = [self[col][i] for col in cols]
+            vals = [col_data[col][i] for col in cols]
             if index:
                 yield Row(int(idx[i]), *vals)
             else:
@@ -1426,9 +1573,10 @@ class DataFrame:
             return DataFrame({k: [v] for k, v in result.items()})
         else:
             cols = self.columns
+            col_data = {col: self._frame.get_column(col) for col in cols}
             rows = []
             for i in range(len(self)):
-                row = {col: self[col][i] for col in cols}
+                row = {col: col_data[col][i] for col in cols}
                 rows.append(func(row))
             if rows and isinstance(rows[0], dict):
                 out: dict = {}
@@ -1477,8 +1625,9 @@ class DataFrame:
         rk = [right_key] if isinstance(right_key, str) else right_key
 
         right_rows: dict = {}
+        rk_data = {c: other._frame.get_column(c) for c in rk}
         for i in range(len(other)):
-            key = tuple(other[c][i] for c in rk)
+            key = tuple(rk_data[c][i] for c in rk)
             right_rows.setdefault(key, []).append(i)
 
         lcols = self.columns
@@ -1489,34 +1638,37 @@ class DataFrame:
             out_col = c if c not in out else c + suffixes[1]
             out[out_col] = []
 
+        lk_data = {c: self._frame.get_column(c) for c in lk}
+        lcols_data = {c: self._frame.get_column(c) for c in lcols}
+        rcols_data = {c: other._frame.get_column(c) for c in rcols}
         matched_right: set = set()
         for i in range(len(self)):
-            key = tuple(self[c][i] for c in lk)
+            key = tuple(lk_data[c][i] for c in lk)
             matches = right_rows.get(key, [])
             if matches:
                 for j in matches:
                     for c in lcols:
-                        out[c].append(self[c][i])
+                        out[c].append(lcols_data[c][i])
                     for c in rcols:
                         out_col = c if c not in {*lcols} else c + suffixes[1]
-                        out[out_col].append(other[c][j])
+                        out[out_col].append(rcols_data[c][j])
                     matched_right.add((key, j))
             elif how in ("left", "outer"):
                 for c in lcols:
-                    out[c].append(self[c][i])
+                    out[c].append(lcols_data[c][i])
                 for c in rcols:
                     out_col = c if c not in {*lcols} else c + suffixes[1]
                     out[out_col].append(float("nan"))
 
         if how in ("right", "outer"):
             for i in range(len(other)):
-                key = tuple(other[c][i] for c in rk)
+                key = tuple(rk_data[c][i] for c in rk)
                 if (key, i) not in matched_right:
                     for c in lcols:
-                        out[c].append(float("nan") if c not in lk else other[rk[lk.index(c)]][i])
+                        out[c].append(float("nan") if c not in lk else rk_data[rk[lk.index(c)]][i])
                     for c in rcols:
                         out_col = c if c not in {*lcols} else c + suffixes[1]
-                        out[out_col].append(other[c][i])
+                        out[out_col].append(rcols_data[c][i])
 
         return DataFrame(out)
 
@@ -1900,10 +2052,13 @@ class DataFrame:
         col_keys = sorted(set(self[columns]))
         from collections import defaultdict
         groups: dict = defaultdict(list)
+        idx_col = self._frame.get_column(index)
+        col_col = self._frame.get_column(columns)
+        val_col = self._frame.get_column(values)
         for i in range(len(self)):
-            rk = self[index][i]
-            ck = self[columns][i]
-            groups[(rk, ck)].append(self[values][i])
+            rk = idx_col[i]
+            ck = col_col[i]
+            groups[(rk, ck)].append(val_col[i])
 
         def _apply_agg(vals):
             if callable(aggfunc):
@@ -2095,11 +2250,12 @@ class DataFrame:
 
         show = min(rows, 10)
         idx = list(self.index)
+        # Pre-load all column data once (avoid O(show×ncols) lazy loads)
+        col_data = {col: self._frame.get_column(col) for col in cols}
         for i in range(show):
             row = f"{idx[i]:>{idx_w}}"
             for col in cols:
-                raw = self[col]
-                v = raw[i] if hasattr(raw, "__getitem__") else "?"
+                v = col_data[col][i]
                 val = "NaN" if (isinstance(v, float) and v != v) or v == "" else str(v)
                 row += f"  {val:>{col_w}}"
             lines.append(row)
@@ -2133,13 +2289,14 @@ class DataFrame:
             html.append(f'<th style="{th_style}">{col}</th>')
         html += ["</tr>", "</thead>", "<tbody>"]
 
+        # Pre-load all column data once
+        col_data = {col: self._frame.get_column(col) for col in cols}
         for i in range(show):
             row_bg = "#fff" if i % 2 == 0 else "#fafafa"
             html.append(f'<tr style="background:{row_bg};">')
             html.append(f'<th style="{th_style}">{idx[i]}</th>')
             for col in cols:
-                raw = self[col]
-                v = raw[i] if hasattr(raw, "__getitem__") else "?"
+                v = col_data[col][i]
                 val = "NaN" if (isinstance(v, float) and v != v) or v == "" else v
                 html.append(f'<td style="{td_style}">{val}</td>')
             html.append("</tr>")

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -27,11 +28,11 @@
 
 // Execution policy compatibility layer
 #if defined(GRIZZLAR_USE_EXECUTION)
-// Prefer parallel where available; AppleClang's implementation was limited
+// par_unseq allows both parallelisation AND vectorisation (SIMD)
 #ifdef __APPLE__
 #define GRIZZLAR_EXEC_POLICY std::execution::seq
 #else
-#define GRIZZLAR_EXEC_POLICY std::execution::par
+#define GRIZZLAR_EXEC_POLICY std::execution::par_unseq
 #endif
 #define GRIZZLAR_SORT(policy, ...) std::sort(policy, __VA_ARGS__)
 #else
@@ -309,24 +310,216 @@ static void mmap_close(MmapView &v)
 
 static bool csv_try_int64(const char *s, size_t len, int64_t &out)
 {
-    if (!len)
-        return false;
-    char *end;
-    errno = 0;
-    long long v = std::strtoll(s, &end, 10);
-    if ((size_t)(end - s) != len || errno)
-        return false;
-    out = static_cast<int64_t>(v);
-    return true;
+    if (!len) return false;
+    auto [end, ec] = std::from_chars(s, s + len, out);
+    return ec == std::errc{} && end == s + len;
 }
 static bool csv_try_double(const char *s, size_t len, double &out)
 {
-    if (!len)
-        return false;
-    char *end;
-    out = std::strtod(s, &end);
-    return (size_t)(end - s) == len;
+    if (!len) return false;
+    auto [end, ec] = std::from_chars(s, s + len, out);
+    return ec == std::errc{} && end == s + len;
 }
+
+static bool is_na_raw(const char *s, size_t len)
+{
+    switch (len)
+    {
+    case 0: return true;
+    case 2: return s[0]=='N' && s[1]=='A';
+    case 3: return (s[0]=='N' && s[1]=='/' && s[2]=='A')
+                || (s[0]=='n' && s[1]=='a' && s[2]=='n')
+                || (s[0]=='N' && s[1]=='a' && s[2]=='N');
+    case 4: return std::memcmp(s,"null",4)==0 || std::memcmp(s,"NULL",4)==0
+                || std::memcmp(s,"None",4)==0;
+    default: return false;
+    }
+}
+
+// ─── StringArray ─────────────────────────────────────────────────────────────
+// Compact flat-buffer string storage (Arrow-style).
+// All string bytes live in one contiguous `data` vector.
+// `offsets[i]` .. `offsets[i+1]` is the byte range for string i.
+//
+// Benefits vs std::vector<std::string>:
+//   filter (compress): one memcpy per contiguous block of matching rows
+//   sort   (gather):   one memcpy per output string, reusing one large buffer
+//   memory: one big allocation instead of n individual heap allocations
+struct StringArray {
+    std::vector<char>     data;
+    std::vector<uint32_t> offsets;  // n+1 entries
+
+    StringArray() { offsets.push_back(0); }
+
+    size_t size()  const { return offsets.size() - 1; }
+    bool   empty() const { return offsets.size() <= 1; }
+
+    std::string_view view(size_t i) const {
+        return {data.data() + offsets[i], offsets[i+1] - offsets[i]};
+    }
+    std::string str(size_t i) const { return std::string(view(i)); }
+
+    void push_back(const char *s, size_t len) {
+        data.insert(data.end(), s, s + len);
+        offsets.push_back(static_cast<uint32_t>(data.size()));
+    }
+    void push_back(std::string_view sv)      { push_back(sv.data(), sv.size()); }
+    void push_back(const std::string &s)     { push_back(s.data(),  s.size());  }
+
+    static StringArray from_strvec(const std::vector<std::string> &strs) {
+        StringArray sa;
+        size_t total = 0;
+        for (auto &s : strs) total += s.size();
+        sa.data.reserve(total);
+        sa.offsets.reserve(strs.size() + 1);
+        for (auto &s : strs) sa.push_back(s.data(), s.size());
+        return sa;
+    }
+    static StringArray from_strvec(std::vector<std::string> &&strs) {
+        return from_strvec(static_cast<const std::vector<std::string>&>(strs));
+    }
+
+    static StringArray from_py_list(const py::list &lst) {
+        StringArray sa;
+        sa.offsets.reserve(static_cast<size_t>(lst.size()) + 1);
+        for (auto item : lst) {
+            if (py::isinstance<py::none>(item)) { sa.push_back("", 0); continue; }
+            auto s = py::cast<std::string>(item);
+            sa.push_back(s.data(), s.size());
+        }
+        return sa;
+    }
+
+    py::list to_py_list() const {
+        py::list lst;
+        size_t n = size();
+        for (size_t i = 0; i < n; ++i)
+            lst.append(py::str(data.data() + offsets[i], offsets[i+1] - offsets[i]));
+        return lst;
+    }
+
+    std::vector<std::string> to_strvec() const {
+        size_t n = size();
+        std::vector<std::string> r(n);
+        for (size_t i = 0; i < n; ++i)
+            r[i].assign(data.data() + offsets[i], offsets[i+1] - offsets[i]);
+        return r;
+    }
+
+    // Compress: keep rows where mask[i] == true.
+    // Copies contiguous blocks via memcpy — one allocation for the output buffer.
+    StringArray compress(const uint8_t *mask, size_t n_rows) const {
+        StringArray sa;
+        uint32_t out_bytes = 0;
+        size_t   out_n    = 0;
+        for (size_t i = 0; i < n_rows; ++i) {
+            if (mask[i]) { out_bytes += offsets[i+1] - offsets[i]; ++out_n; }
+        }
+        sa.data.reserve(out_bytes);
+        sa.offsets.reserve(out_n + 1);
+        size_t i = 0;
+        while (i < n_rows) {
+            if (!mask[i]) { ++i; continue; }
+            size_t blk = i;
+            while (i < n_rows && mask[i]) ++i;
+            const char *src  = data.data() + offsets[blk];
+            uint32_t    nb   = offsets[i] - offsets[blk];
+            uint32_t    base = static_cast<uint32_t>(sa.data.size());
+            sa.data.insert(sa.data.end(), src, src + nb);
+            for (size_t j = blk; j < i; ++j)
+                sa.offsets.push_back(base + offsets[j+1] - offsets[blk]);
+        }
+        return sa;
+    }
+
+    // Gather: reorder rows by permutation locs[0..n_out).
+    StringArray gather(const size_t *locs, size_t n_out) const {
+        StringArray sa;
+        // When gathering all rows (sort), output size == input size — skip estimation pass.
+        uint32_t est;
+        if (n_out == size()) {
+            est = static_cast<uint32_t>(data.size());
+        } else {
+            est = 0;
+            for (size_t j = 0; j < n_out; ++j)
+                est += offsets[locs[j]+1] - offsets[locs[j]];
+        }
+        sa.data.reserve(est);
+        sa.offsets.reserve(n_out + 1);
+        constexpr size_t PF = 8;
+        for (size_t j = 0; j < n_out; ++j) {
+            if (j + PF < n_out)
+                HMDF_PREFETCH_R(data.data() + offsets[locs[j + PF]]);
+            const char *s  = data.data() + offsets[locs[j]];
+            uint32_t    nb = offsets[locs[j]+1] - offsets[locs[j]];
+            sa.data.insert(sa.data.end(), s, s + nb);
+            sa.offsets.push_back(static_cast<uint32_t>(sa.data.size()));
+        }
+        return sa;
+    }
+
+    // Concat: append other after this.
+    StringArray concat_with(const StringArray &other) const {
+        StringArray sa;   // constructor already pushed offsets[0]=0
+        size_t n1 = size(), n2 = other.size();
+        sa.data.reserve(data.size() + other.data.size());
+        sa.offsets.reserve(n1 + n2 + 1);
+        sa.data = data;
+        // Start from i=1: skip offsets[0] which the constructor already added
+        for (size_t i = 1; i <= n1; ++i) sa.offsets.push_back(offsets[i]);
+        uint32_t base = static_cast<uint32_t>(data.size());
+        sa.data.insert(sa.data.end(), other.data.begin(), other.data.end());
+        for (size_t i = 1; i <= n2; ++i)
+            sa.offsets.push_back(base + other.offsets[i]);
+        return sa;
+    }
+
+    // Scatter for joins: positions[j] gives source row (NO_MATCH → empty string).
+    StringArray scatter_join(const std::vector<size_t> &positions,
+                              size_t NO_MATCH) const {
+        StringArray sa;
+        size_t n = positions.size();
+        sa.offsets.reserve(n + 1);
+        for (size_t j = 0; j < n; ++j) {
+            if (positions[j] != NO_MATCH) {
+                size_t r  = positions[j];
+                const char *s  = data.data() + offsets[r];
+                uint32_t    nb = offsets[r+1] - offsets[r];
+                sa.data.insert(sa.data.end(), s, s + nb);
+            }
+            sa.offsets.push_back(static_cast<uint32_t>(sa.data.size()));
+        }
+        return sa;
+    }
+
+    // Rebuild with empty strings replaced by fill.
+    StringArray with_fillna(std::string_view fill) const {
+        StringArray sa;
+        size_t n = size();
+        sa.offsets.reserve(n + 1);
+        for (size_t i = 0; i < n; ++i) {
+            if (offsets[i+1] == offsets[i])
+                sa.push_back(fill.data(), fill.size());
+            else
+                sa.push_back(data.data() + offsets[i], offsets[i+1] - offsets[i]);
+        }
+        return sa;
+    }
+
+    // Rebuild replacing strings according to a map.
+    StringArray with_replace(const std::unordered_map<std::string, std::string> &m) const {
+        StringArray sa;
+        size_t n = size();
+        sa.offsets.reserve(n + 1);
+        for (size_t i = 0; i < n; ++i) {
+            std::string key(data.data() + offsets[i], offsets[i+1] - offsets[i]);
+            auto it = m.find(key);
+            if (it != m.end()) sa.push_back(it->second.data(), it->second.size());
+            else                sa.push_back(data.data() + offsets[i], offsets[i+1] - offsets[i]);
+        }
+        return sa;
+    }
+};
 
 // ─── GrizzlarFrame ────────────────────────────────────────────────────────────
 
@@ -336,6 +529,7 @@ public:
     GDF df_;
     std::unordered_map<std::string, std::string> col_types_;
     std::vector<std::string> col_order_;
+    std::unordered_map<std::string, StringArray> str_cols_; // flat string storage
 
     // ── private helpers ──────────────────────────────────────────────────────
 
@@ -407,19 +601,15 @@ public:
             }
             else
             {
-                const auto &v = df_.get_column<std::string>(name.c_str());
-                std::vector<std::string> nv(n);
-                for (size_t j = 0; j < n; ++j)
-                    nv[j] = v[locs[j]];
-                out.df_.load_column<std::string>(name.c_str(), std::move(nv));
+                out.str_cols_[name] = str_cols_.at(name).gather(locs.data(), n);
             }
         }
         return out;
     }
 
     // Parallel scatter: apply a row permutation/index list to all columns
-    // simultaneously.  Inspired by vaex/polars: each column is independent,
-    // so N columns can be gathered on N threads with no synchronisation.
+    // simultaneously.  String columns use StringArray::gather (one buffer alloc)
+    // instead of per-row std::string copies.
     GrizzlarFrame extract_rows_parallel(const std::vector<size_t> &locs) const
     {
         const size_t n_out = locs.size();
@@ -429,29 +619,26 @@ public:
         out.col_order_ = col_order_;
         out.col_types_ = col_types_;
 
-        struct ColOut
-        {
-            std::vector<int64_t> ints;
-            std::vector<double> dbls;
-            std::vector<bool> bools;
-            std::vector<std::string> strs;
-        };
+        // Separate string columns so they use StringArray::gather
+        std::vector<size_t> str_ci;
+        str_ci.reserve(ncols);
+        for (size_t ci = 0; ci < ncols; ++ci)
+            if (col_types_.at(col_order_[ci]) == "string") str_ci.push_back(ci);
+
+        struct ColOut { std::vector<int64_t> ints; std::vector<double> dbls; std::vector<bool> bools; };
         std::vector<ulong> new_idx(n_out);
         std::vector<ColOut> col_outs(ncols);
+        std::vector<StringArray> str_outs(str_ci.size());
+
         for (size_t ci = 0; ci < ncols; ++ci)
         {
             const std::string &type = col_types_.at(col_order_[ci]);
-            if (type == "double")
-                col_outs[ci].dbls.resize(n_out);
-            else if (type == "int64")
-                col_outs[ci].ints.resize(n_out);
-            else if (type == "bool")
-                col_outs[ci].bools.resize(n_out, false);
-            else
-                col_outs[ci].strs.resize(n_out);
+            if (type == "double")     col_outs[ci].dbls.resize(n_out);
+            else if (type == "int64") col_outs[ci].ints.resize(n_out);
+            else if (type == "bool")  col_outs[ci].bools.resize(n_out, false);
         }
 
-        // gather_unit: 0=index, 1..ncols = each column
+        // gather_unit: 0=index, 1..ncols = numeric/bool columns only
         auto gather_unit = [&](size_t unit)
         {
             if (unit == 0)
@@ -497,45 +684,41 @@ public:
                     for (size_t j = 0; j < n_out; ++j)
                         col_outs[ci].bools[j] = sv[locs[j]];
                 }
-                else
-                {
-                    const auto &sv = df_.get_column<std::string>(cname.c_str());
-                    auto &dv = col_outs[ci].strs;
-                    for (size_t j = 0; j < n_out; ++j)
-                        dv[j] = sv[locs[j]];
-                }
+                // string columns handled in str_outs below
             }
         };
 
         const size_t total_units = ncols + 1;
-        const size_t nthreads = (n_out >= 50000 && ncols >= 2)
-                                    ? std::min(total_units, (size_t)std::thread::hardware_concurrency())
-                                    : 1;
+        const bool do_parallel = (n_out >= 50000 && ncols >= 2);
 
-        if (nthreads <= 1)
+#if defined(GRIZZLAR_USE_EXECUTION)
+        if (do_parallel)
         {
-            for (size_t u = 0; u < total_units; ++u)
-                gather_unit(u);
+            const size_t n_tasks = total_units + str_ci.size();
+            std::vector<size_t> all_tasks(n_tasks);
+            std::iota(all_tasks.begin(), all_tasks.end(), 0);
+            std::for_each(std::execution::par, all_tasks.begin(), all_tasks.end(),
+                [&](size_t tid) {
+                    if (tid < total_units)
+                        gather_unit(tid);
+                    else
+                    {
+                        const size_t si = tid - total_units;
+                        str_outs[si] = str_cols_.at(col_order_[str_ci[si]]).gather(locs.data(), n_out);
+                    }
+                });
         }
         else
         {
-            const size_t upt = (total_units + nthreads - 1) / nthreads;
-            std::vector<std::future<void>> futs;
-            for (size_t t = 0; t < nthreads; ++t)
-            {
-                size_t us = t * upt, ue = std::min(us + upt, total_units);
-                if (us >= total_units)
-                    break;
-                futs.push_back(std::async(std::launch::async,
-                                          [us, ue, &gather_unit]()
-                                          {
-                                              for (size_t u = us; u < ue; ++u)
-                                                  gather_unit(u);
-                                          }));
-            }
-            for (auto &f : futs)
-                f.wait();
+            for (size_t u = 0; u < total_units; ++u) gather_unit(u);
+            for (size_t si = 0; si < str_ci.size(); ++si)
+                str_outs[si] = str_cols_.at(col_order_[str_ci[si]]).gather(locs.data(), n_out);
         }
+#else
+        for (size_t u = 0; u < total_units; ++u) gather_unit(u);
+        for (size_t si = 0; si < str_ci.size(); ++si)
+            str_outs[si] = str_cols_.at(col_order_[str_ci[si]]).gather(locs.data(), n_out);
+#endif
 
         out.df_.load_index(std::move(new_idx));
         for (size_t ci = 0; ci < ncols; ++ci)
@@ -548,9 +731,9 @@ public:
                 out.df_.load_column<int64_t>(cname.c_str(), std::move(col_outs[ci].ints));
             else if (type == "bool")
                 out.df_.load_column<bool>(cname.c_str(), std::move(col_outs[ci].bools));
-            else
-                out.df_.load_column<std::string>(cname.c_str(), std::move(col_outs[ci].strs));
         }
+        for (size_t si = 0; si < str_ci.size(); ++si)
+            out.str_cols_[col_order_[str_ci[si]]] = std::move(str_outs[si]);
         return out;
     }
 
@@ -725,7 +908,7 @@ public:
             int type_id{0};
             std::vector<int64_t> ints;
             std::vector<double> dbls;
-            std::vector<std::string> strs;
+            StringArray sa;   // flat-buffer string storage — no per-string heap alloc
         };
         struct ChunkResult
         {
@@ -748,7 +931,6 @@ public:
                                              for (size_t c = 0; c < ncols; ++c)
                                                  r.cols[c].type_id = type_id[c];
                                              // Pre-reserve: eliminates O(log N) resize passes for 250 K+ rows
-                                             // Each resize of a string vector moves all existing strings.
                                              const size_t est = static_cast<size_t>(ce > cs ? ce - cs : 0) / 30 + 256;
                                              for (size_t c = 0; c < ncols; ++c)
                                              {
@@ -757,10 +939,15 @@ public:
                                                  else if (type_id[c] == 1)
                                                      r.cols[c].dbls.reserve(est);
                                                  else
-                                                     r.cols[c].strs.reserve(est);
+                                                 {
+                                                     r.cols[c].sa.offsets.reserve(est + 1);
+                                                     r.cols[c].sa.data.reserve(est * 12);
+                                                 }
                                              }
-                                             std::vector<std::string> row;
-                                             row.reserve(32);
+
+                                             // Inline field scanner: no std::string allocation for numeric fields.
+                                             // String fields pushed directly into StringArray flat buffer.
+                                             std::string quoted_buf;
                                              const char *p = cs;
                                              while (p < ce)
                                              {
@@ -768,37 +955,65 @@ public:
                                                      std::memchr(p, '\n', ce - p));
                                                  if (!nl)
                                                      nl = ce;
-                                                 size_t len = static_cast<size_t>(nl - p);
-                                                 if (len > 0)
+                                                 const char *row_end = nl;
+                                                 if (row_end > p && *(row_end - 1) == '\r')
+                                                     --row_end;
+
+                                                 if (row_end > p)
                                                  {
-                                                     parse_csv_row_fast(p, len, row);
-                                                     ++r.nrows;
-                                                     for (size_t c = 0; c < ncols && c < row.size(); ++c)
+                                                     const char *fp = p;
+                                                     for (size_t c = 0; c < ncols; ++c)
                                                      {
+                                                         const char *fs;
+                                                         size_t flen;
+                                                         if (fp < row_end && *fp == '"')
+                                                         {
+                                                             ++fp;
+                                                             quoted_buf.clear();
+                                                             while (fp < row_end)
+                                                             {
+                                                                 char ch = *fp++;
+                                                                 if (ch == '"')
+                                                                 {
+                                                                     if (fp < row_end && *fp == '"') { quoted_buf += '"'; ++fp; }
+                                                                     else break;
+                                                                 }
+                                                                 else quoted_buf += ch;
+                                                             }
+                                                             if (fp < row_end && *fp == ',') ++fp;
+                                                             fs = quoted_buf.c_str();
+                                                             flen = quoted_buf.size();
+                                                         }
+                                                         else
+                                                         {
+                                                             fs = fp;
+                                                             while (fp < row_end && *fp != ',') ++fp;
+                                                             flen = static_cast<size_t>(fp - fs);
+                                                             if (fp < row_end) ++fp; // skip ','
+                                                         }
                                                          switch (r.cols[c].type_id)
                                                          {
                                                          case 0:
                                                          {
                                                              int64_t x = std::numeric_limits<int64_t>::min();
-                                                             csv_try_int64(row[c].c_str(), row[c].size(), x);
+                                                             csv_try_int64(fs, flen, x);
                                                              r.cols[c].ints.push_back(x);
                                                              break;
                                                          }
                                                          case 1:
                                                          {
                                                              double x = std::numeric_limits<double>::quiet_NaN();
-                                                             csv_try_double(row[c].c_str(), row[c].size(), x);
+                                                             csv_try_double(fs, flen, x);
                                                              r.cols[c].dbls.push_back(x);
                                                              break;
                                                          }
-                                                         // Move from row buffer — parse_csv_row_fast clears row on
-                                                         // the next call, so the moved-from state is safe to destroy.
                                                          case 2:
-                                                             r.cols[c].strs.push_back(
-                                                                 is_na_string(row[c]) ? std::string{} : std::move(row[c]));
+                                                             r.cols[c].sa.push_back(
+                                                                 is_na_raw(fs, flen) ? std::string_view{} : std::string_view{fs, flen});
                                                              break;
                                                          }
                                                      }
+                                                     ++r.nrows;
                                                  }
                                                  p = nl + 1;
                                              }
@@ -822,11 +1037,11 @@ public:
             int type_id{0};
             std::vector<int64_t> ints;
             std::vector<double> dbls;
-            std::vector<std::string> strs;
+            StringArray sa;
         };
         std::vector<MergedCol> merged(ncols);
-        for (size_t c = 0; c < ncols; ++c)
-        {
+
+        auto merge_col = [&](size_t c) {
             merged[c].type_id = type_id[c];
             switch (type_id[c])
             {
@@ -842,15 +1057,32 @@ public:
                     merged[c].dbls.insert(merged[c].dbls.end(),
                                           ch.cols[c].dbls.begin(), ch.cols[c].dbls.end());
                 break;
-            case 2:
-                merged[c].strs.reserve(total_rows);
-                for (auto &ch : chunks)
-                    merged[c].strs.insert(merged[c].strs.end(),
-                                          std::make_move_iterator(ch.cols[c].strs.begin()),
-                                          std::make_move_iterator(ch.cols[c].strs.end()));
+            case 2: {
+                size_t total_bytes = 0;
+                for (auto &ch : chunks) total_bytes += ch.cols[c].sa.data.size();
+                merged[c].sa.data.reserve(total_bytes);
+                merged[c].sa.offsets.reserve(total_rows + 1);
+                for (auto &ch : chunks) {
+                    uint32_t base = static_cast<uint32_t>(merged[c].sa.data.size());
+                    merged[c].sa.data.insert(merged[c].sa.data.end(),
+                                             ch.cols[c].sa.data.begin(), ch.cols[c].sa.data.end());
+                    for (size_t i = 1; i <= ch.cols[c].sa.size(); ++i)
+                        merged[c].sa.offsets.push_back(base + ch.cols[c].sa.offsets[i]);
+                }
                 break;
             }
+            }
+        };
+
+#if defined(GRIZZLAR_USE_EXECUTION)
+        {
+            std::vector<size_t> col_ids(ncols);
+            std::iota(col_ids.begin(), col_ids.end(), 0);
+            std::for_each(std::execution::par, col_ids.begin(), col_ids.end(), merge_col);
         }
+#else
+        for (size_t c = 0; c < ncols; ++c) merge_col(c);
+#endif
 
         // ── assemble GrizzlarFrame ─────────────────────────────────────────────
         GrizzlarFrame out;
@@ -902,7 +1134,7 @@ public:
                 break;
             case 2:
                 out.col_types_[nm] = "string";
-                out.df_.load_column<std::string>(nm.c_str(), std::move(merged[c].strs));
+                out.str_cols_[nm] = std::move(merged[c].sa);
                 break;
             }
         }
@@ -981,12 +1213,8 @@ public:
         const size_t nspecs = specs.size();
         const size_t N = key_vec.size();
 
-        // Pre-fetch column data pointers for direct access (avoids repeated map lookups)
-        struct ColPtr
-        {
-            const double *dbl{nullptr};
-            const int64_t *i64{nullptr};
-        };
+        // Pre-fetch column data pointers
+        struct ColPtr { const double *dbl{nullptr}; const int64_t *i64{nullptr}; };
         std::vector<ColPtr> col_ptrs(nspecs);
         for (size_t s = 0; s < nspecs; ++s)
         {
@@ -1000,7 +1228,6 @@ public:
                 throw std::runtime_error("Cannot aggregate non-numeric column: " + col);
         }
 
-        // Running-stats accumulator per group per spec — no index vectors stored
         struct RunState
         {
             double sum{0}, min_v{1e300}, max_v{-1e300}, sum_sq{0};
@@ -1009,92 +1236,163 @@ public:
             bool initialized{false};
         };
 
-        std::unordered_map<K, std::vector<RunState>> groups;
-        groups.reserve(N / 8 + 16);
-
-        for (size_t i = 0; i < N; ++i)
+        auto update = [&](RunState &st, double v)
         {
-            auto &states = groups[key_vec[i]];
-            if (states.empty())
-                states.resize(nspecs);
-            for (size_t s = 0; s < nspecs; ++s)
+            if (!st.initialized) { st.first_v = v; st.min_v = v; st.max_v = v; st.initialized = true; }
+            ++st.count; st.sum += v; st.sum_sq += v * v; st.last_v = v;
+            if (v < st.min_v) st.min_v = v;
+            if (v > st.max_v) st.max_v = v;
+        };
+
+        auto finalize = [&](const RunState &st, const std::string &func) -> double
+        {
+            if (func == "count") return static_cast<double>(st.count);
+            if (func == "sum")   return st.sum;
+            if (func == "mean")  return st.sum / static_cast<double>(st.count);
+            if (func == "min")   return st.min_v;
+            if (func == "max")   return st.max_v;
+            if (func == "first") return st.first_v;
+            if (func == "last")  return st.last_v;
+            if (func == "std")
             {
-                const double v = col_ptrs[s].dbl ? col_ptrs[s].dbl[i]
-                                                 : static_cast<double>(col_ptrs[s].i64[i]);
-                RunState &st = states[s];
-                if (!st.initialized)
-                {
-                    st.first_v = v;
-                    st.min_v = v;
-                    st.max_v = v;
-                    st.initialized = true;
-                }
-                st.count++;
-                st.sum += v;
-                st.sum_sq += v * v;
-                st.last_v = v;
-                if (v < st.min_v)
-                    st.min_v = v;
-                if (v > st.max_v)
-                    st.max_v = v;
+                double m = st.sum / static_cast<double>(st.count);
+                double var = st.sum_sq / static_cast<double>(st.count) - m * m;
+                if (st.count > 1) var = var * static_cast<double>(st.count) / static_cast<double>(st.count - 1);
+                return st.count > 0 ? std::sqrt(std::max(0.0, var)) : 0.0;
             }
+            throw std::runtime_error("Unknown aggregation function: " + func);
+        };
+
+        using GroupMap = std::unordered_map<K, std::vector<RunState>>;
+
+        // ── Choose parallelism: power-of-2 partitions, one per thread. ──────────
+        // Small datasets or low-cardinality groupby go single-threaded to avoid
+        // hash + partition overhead.
+        const size_t hw = std::thread::hardware_concurrency();
+        size_t P = 1;
+        if (N >= 50000 && hw >= 2)
+        {
+            while (P * 2 <= hw) P *= 2;  // largest power-of-2 <= hw
         }
 
-        // Deterministic output order
+        // ── Single-threaded fast path ────────────────────────────────────────────
+        if (P == 1)
+        {
+            GroupMap groups;
+            groups.reserve(std::min(N / 4 + 8, (size_t)65536));
+            for (size_t i = 0; i < N; ++i)
+            {
+                auto &states = groups[key_vec[i]];
+                if (states.empty()) states.resize(nspecs);
+                for (size_t s = 0; s < nspecs; ++s)
+                    update(states[s], col_ptrs[s].dbl ? col_ptrs[s].dbl[i]
+                                                      : static_cast<double>(col_ptrs[s].i64[i]));
+            }
+            std::vector<K> sorted_keys;
+            sorted_keys.reserve(groups.size());
+            for (auto &[k, _] : groups) sorted_keys.push_back(k);
+            std::sort(sorted_keys.begin(), sorted_keys.end());
+
+            const size_t ng = sorted_keys.size();
+            std::vector<K> result_keys; result_keys.reserve(ng);
+            std::vector<std::vector<double>> agg_results(nspecs);
+            for (auto &v : agg_results) v.reserve(ng);
+            for (const K &key : sorted_keys)
+            {
+                result_keys.push_back(key);
+                const auto &states = groups[key];
+                for (size_t s = 0; s < nspecs; ++s)
+                    agg_results[s].push_back(finalize(states[s], specs[s].second));
+            }
+            return build_groupby_frame(by_col, result_keys, agg_results, specs);
+        }
+
+        // ── Parallel hash-partition path (polars-style) ──────────────────────────
+        // hash(key) & (P-1) → partition index. All rows with the same key go to
+        // the same partition, so each thread's GroupMap has disjoint keys.
+        // No merge step needed — just collect and sort at the end.
+        const size_t mask = P - 1;
+
+        // Step 1: compute partition for every row (vectorizable, O(N))
+        std::vector<uint32_t> row_part(N);
+        for (size_t i = 0; i < N; ++i)
+            row_part[i] = static_cast<uint32_t>(std::hash<K>{}(key_vec[i]) & mask);
+
+        // Step 2: scatter row indices into per-partition lists (O(N))
+        std::vector<size_t> part_sizes(P, 0);
+        for (size_t i = 0; i < N; ++i) ++part_sizes[row_part[i]];
+        std::vector<std::vector<size_t>> parts(P);
+        for (size_t p = 0; p < P; ++p) parts[p].reserve(part_sizes[p]);
+        for (size_t i = 0; i < N; ++i) parts[row_part[i]].push_back(i);
+
+        // Step 3: parallel aggregation — each partition owns disjoint keys
+        std::vector<GroupMap> part_maps(P);
+        {
+#if defined(GRIZZLAR_USE_EXECUTION)
+            std::vector<size_t> part_ids(P);
+            std::iota(part_ids.begin(), part_ids.end(), 0);
+            std::for_each(std::execution::par, part_ids.begin(), part_ids.end(),
+                [&](size_t p)
+                {
+                    auto &gmap = part_maps[p];
+                    gmap.reserve(parts[p].size() / 2 + 4);
+                    for (size_t idx : parts[p])
+                    {
+                        auto &states = gmap[key_vec[idx]];
+                        if (states.empty()) states.resize(nspecs);
+                        for (size_t s = 0; s < nspecs; ++s)
+                            update(states[s], col_ptrs[s].dbl ? col_ptrs[s].dbl[idx]
+                                                              : static_cast<double>(col_ptrs[s].i64[idx]));
+                    }
+                });
+#else
+            for (size_t p = 0; p < P; ++p)
+            {
+                auto &gmap = part_maps[p];
+                gmap.reserve(parts[p].size() / 2 + 4);
+                for (size_t idx : parts[p])
+                {
+                    auto &states = gmap[key_vec[idx]];
+                    if (states.empty()) states.resize(nspecs);
+                    for (size_t s = 0; s < nspecs; ++s)
+                        update(states[s], col_ptrs[s].dbl ? col_ptrs[s].dbl[idx]
+                                                          : static_cast<double>(col_ptrs[s].i64[idx]));
+                }
+            }
+#endif
+        }
+
+        // Step 4: collect all keys, sort for deterministic output
         std::vector<K> sorted_keys;
-        sorted_keys.reserve(groups.size());
-        for (auto &[k, _] : groups)
-            sorted_keys.push_back(k);
+        sorted_keys.reserve(N / 4 + 4);
+        for (size_t p = 0; p < P; ++p)
+            for (auto &[k, _] : part_maps[p]) sorted_keys.push_back(k);
         std::sort(sorted_keys.begin(), sorted_keys.end());
 
         const size_t ng = sorted_keys.size();
-        std::vector<K> result_keys;
-        result_keys.reserve(ng);
+        std::vector<K> result_keys; result_keys.reserve(ng);
         std::vector<std::vector<double>> agg_results(nspecs);
-        for (auto &v : agg_results)
-            v.reserve(ng);
+        for (auto &v : agg_results) v.reserve(ng);
 
         for (const K &key : sorted_keys)
         {
             result_keys.push_back(key);
-            const auto &states = groups[key];
+            // O(1) lookup: same hash partition as during aggregation
+            const auto &states = part_maps[std::hash<K>{}(key) & mask].at(key);
             for (size_t s = 0; s < nspecs; ++s)
-            {
-                const RunState &st = states[s];
-                const auto &func = specs[s].second;
-                double res = 0;
-                if (func == "count")
-                    res = static_cast<double>(st.count);
-                else if (func == "sum")
-                    res = st.sum;
-                else if (func == "mean")
-                    res = st.sum / static_cast<double>(st.count);
-                else if (func == "min")
-                    res = st.min_v;
-                else if (func == "max")
-                    res = st.max_v;
-                else if (func == "first")
-                    res = st.first_v;
-                else if (func == "last")
-                    res = st.last_v;
-                else if (func == "std")
-                {
-                    // Welford/two-pass equivalent via E[X²] - E[X]²
-                    double m = st.sum / static_cast<double>(st.count);
-                    double var = st.sum_sq / static_cast<double>(st.count) - m * m;
-                    if (st.count > 1)
-                        var = var * static_cast<double>(st.count) /
-                              static_cast<double>(st.count - 1);
-                    res = st.count > 0 ? std::sqrt(std::max(0.0, var)) : 0.0;
-                }
-                else
-                {
-                    throw std::runtime_error("Unknown aggregation function: " + func);
-                }
-                agg_results[s].push_back(res);
-            }
+                agg_results[s].push_back(finalize(states[s], specs[s].second));
         }
+        return build_groupby_frame(by_col, result_keys, agg_results, specs);
+    }
 
+    // Build a GrizzlarFrame from sorted groupby result vectors.
+    template<typename K>
+    GrizzlarFrame build_groupby_frame(const std::string &by_col,
+                                       std::vector<K> &result_keys,
+                                       std::vector<std::vector<double>> &agg_results,
+                                       const std::vector<std::pair<std::string, std::string>> &specs) const
+    {
+        const size_t ng = result_keys.size();
         GrizzlarFrame out;
         std::vector<ulong> new_idx(ng);
         std::iota(new_idx.begin(), new_idx.end(), 0);
@@ -1103,21 +1401,17 @@ public:
         out.col_order_.push_back(by_col);
         if constexpr (std::is_same_v<K, std::string_view>)
         {
-            // string_view keys — convert to std::string for hmdf storage
             out.col_types_[by_col] = "string";
-            std::vector<std::string> str_keys;
-            str_keys.reserve(result_keys.size());
-            for (auto sv : result_keys)
-                str_keys.emplace_back(sv);
-            out.df_.load_column<std::string>(by_col.c_str(), std::move(str_keys));
+            StringArray str_keys;
+            for (auto sv : result_keys) str_keys.push_back(sv);
+            out.str_cols_[by_col] = std::move(str_keys);
         }
         else
         {
             out.col_types_[by_col] = col_types_.at(by_col);
             out.df_.load_column<K>(by_col.c_str(), std::move(result_keys));
         }
-
-        for (size_t s = 0; s < nspecs; ++s)
+        for (size_t s = 0; s < specs.size(); ++s)
         {
             const auto &col = specs[s].first;
             out.col_order_.push_back(col);
@@ -1162,7 +1456,7 @@ public:
         else if (type == "bool")
             df_.load_column<bool>(name.c_str(), to_vec<bool>(data));
         else
-            df_.load_column<std::string>(name.c_str(), to_str_vec(data));
+            str_cols_[name] = StringArray::from_py_list(py::cast<py::list>(data));
     }
 
     // ── accessors ────────────────────────────────────────────────────────────
@@ -1204,19 +1498,16 @@ public:
                 lst.append(py::bool_(v));
             return lst;
         }
-        const auto &vec = df_.get_column<std::string>(name.c_str());
-        py::list lst;
-        for (const auto &s : vec)
-            lst.append(py::str(s));
-        return lst;
+        return str_cols_.at(name).to_py_list();
     }
 
     std::vector<std::string> columns() const { return col_order_; }
 
     py::tuple shape() const
     {
-        auto [r, c] = df_.shape();
-        return py::make_tuple(r, c);
+        size_t nrows = df_.get_index().size();
+        size_t ncols = col_order_.size();
+        return py::make_tuple(nrows, ncols);
     }
 
     bool has_column(const std::string &name) const
@@ -1315,24 +1606,47 @@ public:
             return df_.get_column<int64_t>(col.c_str()).size();
         if (type == "bool")
             return df_.get_column<bool>(col.c_str()).size();
-        return df_.get_column<std::string>(col.c_str()).size();
+        return str_cols_.at(col).size();
     }
     py::dict describe()
     {
-        py::dict result;
+        // Collect numeric columns in definition order.
+        std::vector<std::string> num_cols;
         for (const auto &name : col_order_)
         {
-            const std::string &type = col_types_.at(name);
-            if (type != "double" && type != "int64")
-                continue;
-            py::dict stats;
-            stats["count"] = count(name);
-            stats["mean"] = mean(name);
-            stats["std"] = std_dev(name);
-            stats["min"] = col_min(name);
-            stats["max"] = col_max(name);
-            stats["sum"] = sum(name);
-            result[name.c_str()] = stats;
+            const auto &t = col_types_.at(name);
+            if (t == "double" || t == "int64") num_cols.push_back(name);
+        }
+        if (num_cols.empty()) return py::dict();
+
+        const size_t nc = num_cols.size();
+        std::vector<DescribeStats> raw(nc);
+
+        // _describe_raw is pure C++ — safe to run without the GIL.
+        // Release GIL and use par execution policy so all column sorts run concurrently
+        // via the ConcRT/TBB thread pool (zero thread-creation overhead vs std::async).
+        {
+            py::gil_scoped_release release;
+#if defined(GRIZZLAR_USE_EXECUTION)
+            std::vector<size_t> col_ids(nc);
+            std::iota(col_ids.begin(), col_ids.end(), 0);
+            std::for_each(std::execution::par, col_ids.begin(), col_ids.end(),
+                [&](size_t i) { raw[i] = _describe_raw(num_cols[i]); });
+#else
+            for (size_t i = 0; i < nc; ++i) raw[i] = _describe_raw(num_cols[i]);
+#endif
+        }
+
+        // GIL re-acquired here — build Python dicts.
+        py::dict result;
+        for (size_t i = 0; i < nc; ++i)
+        {
+            const auto &r = raw[i];
+            py::dict d;
+            d["count"] = r.count; d["mean"]  = r.mean;  d["std"]  = r.std_v;
+            d["min"]   = r.min_v; d["25%"]   = r.q25;   d["50%"]  = r.q50;
+            d["75%"]   = r.q75;   d["max"]   = r.max_v;
+            result[num_cols[i].c_str()] = d;
         }
         return result;
     }
@@ -1657,43 +1971,51 @@ public:
 
         if (type == "string")
         {
-            const auto &raw = df_.get_column<std::string>(col.c_str());
-            // Build a string_view vector: avoids SSO/heap indirection per comparison
-            std::vector<std::string_view> keys(n);
+            // (key, idx) pairs: string_view + index stored adjacently so the
+            // comparator never dereferences through a separate keys array.
+            struct PairSV { std::string_view key; uint32_t idx; };
+            const StringArray &sa = str_cols_.at(col);
+            std::vector<PairSV> pairs(n);
             for (size_t i = 0; i < n; ++i)
-                keys[i] = raw[i];
+                pairs[i] = {sa.view(i), static_cast<uint32_t>(i)};
             if (ascending)
-                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                              [&](size_t a, size_t b)
-                              { return keys[a] < keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, pairs.begin(), pairs.end(),
+                              [](const PairSV &a, const PairSV &b)
+                              { return a.key < b.key; });
             else
-                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                              [&](size_t a, size_t b)
-                              { return keys[a] > keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, pairs.begin(), pairs.end(),
+                              [](const PairSV &a, const PairSV &b)
+                              { return a.key > b.key; });
+            for (size_t i = 0; i < n; ++i) perm[i] = pairs[i].idx;
         }
         else if (type == "int64")
         {
-            const auto &keys = df_.get_column<int64_t>(col.c_str());
+            // (key, idx) pairs: comparator touches adjacent memory — no indirection.
+            struct Pair64 { int64_t key; uint32_t idx; };
+            const auto &raw = df_.get_column<int64_t>(col.c_str());
+            std::vector<Pair64> pairs(n);
+            for (size_t i = 0; i < n; ++i) pairs[i] = {raw[i], static_cast<uint32_t>(i)};
             if (ascending)
-                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                              [&](size_t a, size_t b)
-                              { return keys[a] < keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, pairs.begin(), pairs.end(),
+                              [](const Pair64 &a, const Pair64 &b) { return a.key < b.key; });
             else
-                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                              [&](size_t a, size_t b)
-                              { return keys[a] > keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, pairs.begin(), pairs.end(),
+                              [](const Pair64 &a, const Pair64 &b) { return a.key > b.key; });
+            for (size_t i = 0; i < n; ++i) perm[i] = pairs[i].idx;
         }
         else if (type == "double")
         {
-            const auto &keys = df_.get_column<double>(col.c_str());
+            struct PairDbl { double key; uint32_t idx; };
+            const auto &raw = df_.get_column<double>(col.c_str());
+            std::vector<PairDbl> pairs(n);
+            for (size_t i = 0; i < n; ++i) pairs[i] = {raw[i], static_cast<uint32_t>(i)};
             if (ascending)
-                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                              [&](size_t a, size_t b)
-                              { return keys[a] < keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, pairs.begin(), pairs.end(),
+                              [](const PairDbl &a, const PairDbl &b) { return a.key < b.key; });
             else
-                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, perm.begin(), perm.end(),
-                              [&](size_t a, size_t b)
-                              { return keys[a] > keys[b]; });
+                GRIZZLAR_SORT(GRIZZLAR_EXEC_POLICY, pairs.begin(), pairs.end(),
+                              [](const PairDbl &a, const PairDbl &b) { return a.key > b.key; });
+            for (size_t i = 0; i < n; ++i) perm[i] = pairs[i].idx;
         }
         else
         {
@@ -1725,156 +2047,143 @@ public:
     // Filter rows using a Python boolean mask (list[bool] or numpy bool array).
     // Direct compress: no intermediate index vector, sequential access (SIMD-friendly).
     // For frames with >= 50K output rows, processes columns in parallel threads.
-    GrizzlarFrame filter_by_mask(py::object mask_obj) const
+    // Internal compress: shared by filter_by_mask, filter_col_scalar, filter_by_mask_list.
+    // mask is uint8_t (not bool) for SIMD-friendly comparison loops.
+    GrizzlarFrame compress_by_uint8(const uint8_t *m, size_t n, size_t out_n) const
     {
-        const auto &idx = df_.get_index();
-        const size_t n = idx.size();
-
-        // Get raw bool pointer — avoid copying to std::vector<bool>
-        auto arr = py::cast<py::array_t<bool, py::array::c_style | py::array::forcecast>>(mask_obj);
-        auto buf_info = arr.request();
-        if (static_cast<size_t>(buf_info.size) != n)
-            throw std::runtime_error("mask length " + std::to_string(buf_info.size) +
-                                     " != frame length " + std::to_string(n));
-        const bool *m = static_cast<const bool *>(buf_info.ptr);
-
-        // Count output rows
-        size_t out_n = 0;
-        for (size_t i = 0; i < n; ++i)
-            out_n += static_cast<size_t>(m[i]);
-
-        if (out_n == n)
-            return deep_copy(); // all pass — fast path
-
         GrizzlarFrame out;
         out.col_order_ = col_order_;
         out.col_types_ = col_types_;
         const size_t ncols = col_order_.size();
 
-        // Pre-allocate all output column storage so threads can write in parallel
-        struct ColOut
-        {
-            std::vector<int64_t> ints;
-            std::vector<double> dbls;
-            std::vector<bool> bools;
-            std::vector<std::string> strs;
-        };
+        std::vector<size_t> str_ci;
+        str_ci.reserve(ncols);
+        for (size_t ci = 0; ci < ncols; ++ci)
+            if (col_types_.at(col_order_[ci]) == "string") str_ci.push_back(ci);
+
+        struct ColOut { std::vector<int64_t> ints; std::vector<double> dbls; std::vector<bool> bools; };
         std::vector<ulong> new_idx(out_n);
         std::vector<ColOut> col_outs(ncols);
+        std::vector<StringArray> str_outs(str_ci.size());
+
         for (size_t ci = 0; ci < ncols; ++ci)
         {
             const std::string &type = col_types_.at(col_order_[ci]);
-            if (type == "double")
-                col_outs[ci].dbls.resize(out_n);
-            else if (type == "int64")
-                col_outs[ci].ints.resize(out_n);
-            else if (type == "bool")
-                col_outs[ci].bools.resize(out_n, false);
-            else
-                col_outs[ci].strs.reserve(out_n);
+            if (type == "double")     col_outs[ci].dbls.resize(out_n);
+            else if (type == "int64") col_outs[ci].ints.resize(out_n);
+            else if (type == "bool")  col_outs[ci].bools.resize(out_n, false);
         }
 
-        // compress_unit: 0 = index, 1..ncols = columns
-        // Each unit's inner loop is a sequential compress (fast / SIMD-vectorisable)
         auto compress_unit = [&](size_t unit)
         {
             if (unit == 0)
             {
                 ulong *dst = new_idx.data();
-                const ulong *src = idx.data();
+                const ulong *src = df_.get_index().data();
                 for (size_t i = 0; i < n; ++i)
-                    if (m[i])
-                        *dst++ = src[i];
+                    if (m[i]) *dst++ = src[i];
             }
             else
             {
                 const size_t ci = unit - 1;
                 const std::string &cname = col_order_[ci];
-                const std::string &type = col_types_.at(cname);
+                const std::string &type  = col_types_.at(cname);
                 if (type == "double")
                 {
-                    const auto &src = df_.get_column<double>(cname.c_str());
+                    const double *src = df_.get_column<double>(cname.c_str()).data();
                     double *dp = col_outs[ci].dbls.data();
-                    for (size_t i = 0; i < src.size() && i < n; ++i)
-                        if (m[i])
-                            *dp++ = src[i];
+                    for (size_t i = 0; i < n; ++i)
+                        if (m[i]) *dp++ = src[i];
                 }
                 else if (type == "int64")
                 {
-                    const auto &src = df_.get_column<int64_t>(cname.c_str());
+                    const int64_t *src = df_.get_column<int64_t>(cname.c_str()).data();
                     int64_t *dp = col_outs[ci].ints.data();
-                    for (size_t i = 0; i < src.size() && i < n; ++i)
-                        if (m[i])
-                            *dp++ = src[i];
+                    for (size_t i = 0; i < n; ++i)
+                        if (m[i]) *dp++ = src[i];
                 }
                 else if (type == "bool")
                 {
                     const auto &src = df_.get_column<bool>(cname.c_str());
                     size_t w = 0;
-                    for (size_t i = 0; i < src.size() && i < n; ++i)
-                        if (m[i])
-                            col_outs[ci].bools[w++] = src[i];
+                    for (size_t i = 0; i < n; ++i)
+                        if (m[i]) col_outs[ci].bools[w++] = src[i];
                 }
-                else
-                {
-                    const auto &src = df_.get_column<std::string>(cname.c_str());
-                    auto &dst_v = col_outs[ci].strs;
-                    for (size_t i = 0; i < src.size() && i < n; ++i)
-                        if (m[i])
-                            dst_v.push_back(src[i]);
-                }
+                // string columns handled in str_outs below
             }
         };
 
         const size_t total_units = ncols + 1;
-        // Use parallel threads only for large frames (thread overhead amortised)
-        const size_t nthreads = (out_n >= 50000 && ncols >= 2)
-                                    ? std::min(total_units,
-                                               static_cast<size_t>(std::thread::hardware_concurrency()))
-                                    : 1;
+        const bool do_parallel = (out_n >= 50000 && ncols >= 2);
 
-        if (nthreads <= 1)
+#if defined(GRIZZLAR_USE_EXECUTION)
+        if (do_parallel)
         {
-            for (size_t u = 0; u < total_units; ++u)
-                compress_unit(u);
+            // Unified task list: [0..total_units) = compress_unit(u),
+            // [total_units..total_units+str_ci.size()) = StringArray::compress for string cols.
+            // std::execution::par reuses the ConcRT/TBB thread pool — zero thread-creation overhead.
+            const size_t n_tasks = total_units + str_ci.size();
+            std::vector<size_t> all_tasks(n_tasks);
+            std::iota(all_tasks.begin(), all_tasks.end(), 0);
+            std::for_each(std::execution::par, all_tasks.begin(), all_tasks.end(),
+                [&](size_t tid) {
+                    if (tid < total_units)
+                        compress_unit(tid);
+                    else
+                    {
+                        const size_t si = tid - total_units;
+                        str_outs[si] = str_cols_.at(col_order_[str_ci[si]]).compress(m, n);
+                    }
+                });
         }
         else
         {
-            const size_t upt = (total_units + nthreads - 1) / nthreads;
-            std::vector<std::future<void>> futs;
-            for (size_t t = 0; t < nthreads; ++t)
-            {
-                size_t ustart = t * upt;
-                if (ustart >= total_units)
-                    break;
-                size_t uend = std::min(ustart + upt, total_units);
-                futs.push_back(std::async(std::launch::async,
-                                          [ustart, uend, &compress_unit]()
-                                          {
-                                              for (size_t u = ustart; u < uend; ++u)
-                                                  compress_unit(u);
-                                          }));
-            }
-            for (auto &f : futs)
-                f.wait();
+            for (size_t u = 0; u < total_units; ++u) compress_unit(u);
+            for (size_t si = 0; si < str_ci.size(); ++si)
+                str_outs[si] = str_cols_.at(col_order_[str_ci[si]]).compress(m, n);
         }
+#else
+        for (size_t u = 0; u < total_units; ++u) compress_unit(u);
+        for (size_t si = 0; si < str_ci.size(); ++si)
+            str_outs[si] = str_cols_.at(col_order_[str_ci[si]]).compress(m, n);
+#endif
 
-        // Load into output frame (sequential — load_column is not thread-safe)
         out.df_.load_index(std::move(new_idx));
         for (size_t ci = 0; ci < ncols; ++ci)
         {
             const std::string &cname = col_order_[ci];
-            const std::string &type = col_types_.at(cname);
+            const std::string &type  = col_types_.at(cname);
             if (type == "double")
                 out.df_.load_column<double>(cname.c_str(), std::move(col_outs[ci].dbls));
             else if (type == "int64")
                 out.df_.load_column<int64_t>(cname.c_str(), std::move(col_outs[ci].ints));
             else if (type == "bool")
                 out.df_.load_column<bool>(cname.c_str(), std::move(col_outs[ci].bools));
-            else
-                out.df_.load_column<std::string>(cname.c_str(), std::move(col_outs[ci].strs));
         }
+        for (size_t si = 0; si < str_ci.size(); ++si)
+            out.str_cols_[col_order_[str_ci[si]]] = std::move(str_outs[si]);
         return out;
+    }
+
+    GrizzlarFrame filter_by_mask(py::object mask_obj) const
+    {
+        const auto &idx = df_.get_index();
+        const size_t n = idx.size();
+
+        auto arr = py::cast<py::array_t<bool, py::array::c_style | py::array::forcecast>>(mask_obj);
+        auto buf_info = arr.request();
+        if (static_cast<size_t>(buf_info.size) != n)
+            throw std::runtime_error("mask length " + std::to_string(buf_info.size) +
+                                     " != frame length " + std::to_string(n));
+        const bool *bm = static_cast<const bool *>(buf_info.ptr);
+
+        // Convert bool→uint8_t for SIMD-friendly loops in compress_by_uint8
+        std::vector<uint8_t> m(n);
+        size_t out_n = 0;
+        for (size_t i = 0; i < n; ++i) { m[i] = bm[i] ? 1 : 0; out_n += m[i]; }
+
+        if (out_n == n) return deep_copy();
+        return compress_by_uint8(m.data(), n, out_n);
     }
 
     // Slice rows by integer position [start, stop).
@@ -1901,6 +2210,7 @@ public:
         out.df_ = df_;
         out.col_types_ = col_types_;
         out.col_order_ = col_order_;
+        out.str_cols_  = str_cols_;
         return out;
     }
 
@@ -1927,7 +2237,7 @@ public:
             else if (type == "bool")
                 out.df_.load_column<bool>(name.c_str(), df_.get_column<bool>(name.c_str()));
             else
-                out.df_.load_column<std::string>(name.c_str(), df_.get_column<std::string>(name.c_str()));
+                out.str_cols_[name] = str_cols_.at(name);
         }
         return out;
     }
@@ -1958,12 +2268,12 @@ public:
         }
         else if (by_type == "string")
         {
-            const auto &v = df_.get_column<std::string>(by_col.c_str());
-            // string_view keys: avoids copying 2M strings into a new vector
+            const StringArray &sa = str_cols_.at(by_col);
+            // string_view keys: avoids copying strings into a new vector
             std::vector<std::string_view> key_views;
-            key_views.reserve(v.size());
-            for (const auto &s : v)
-                key_views.emplace_back(s);
+            key_views.reserve(sa.size());
+            for (size_t i = 0; i < sa.size(); ++i)
+                key_views.emplace_back(sa.view(i));
             return do_groupby<std::string_view>(by_col, key_views, specs);
         }
         throw std::runtime_error("Cannot group by column of type: " + by_type);
@@ -2083,7 +2393,6 @@ public:
             std::vector<int64_t> ints;
             std::vector<double> dbls;
             std::vector<bool> bools;
-            std::vector<std::string> strs;
         };
         std::vector<ulong> new_idx(n);
         std::vector<ColBuf> col_bufs(nleft + nright);
@@ -2096,8 +2405,7 @@ public:
                 col_bufs[ci].ints.resize(n, 0);
             else if (type == "bool")
                 col_bufs[ci].bools.resize(n, false);
-            else
-                col_bufs[ci].strs.resize(n);
+            // string cols handled via scatter_join after parallel scatter
         };
         for (size_t ci = 0; ci < nleft; ++ci)
             alloc_buf(ci, col_types_.at(col_order_[ci]));
@@ -2142,14 +2450,7 @@ public:
                         if (left_pos[j] != NO_MATCH)
                             dv[j] = sv[left_pos[j]];
                 }
-                else
-                {
-                    const auto &sv = df_.get_column<std::string>(cname.c_str());
-                    auto &dv = col_bufs[ci].strs;
-                    for (size_t j = 0; j < n; ++j)
-                        if (left_pos[j] != NO_MATCH)
-                            dv[j] = sv[left_pos[j]];
-                }
+                // string cols handled via scatter_join after parallel scatter
             }
             else
             {
@@ -2180,46 +2481,27 @@ public:
                         if (right_pos[j] != NO_MATCH)
                             dv[j] = sv[right_pos[j]];
                 }
-                else
-                {
-                    const auto &sv = rhs.df_.get_column<std::string>(cname.c_str());
-                    auto &dv = col_bufs[nleft + ci].strs;
-                    for (size_t j = 0; j < n; ++j)
-                        if (right_pos[j] != NO_MATCH)
-                            dv[j] = sv[right_pos[j]];
-                }
+                // string cols handled via scatter_join after parallel scatter
             }
         };
 
-        const size_t nthreads = (n >= 10000 && total_units >= 2)
-                                    ? std::min(total_units, (size_t)std::thread::hardware_concurrency())
-                                    : 1;
+        const bool do_parallel_scatter = (n >= 10000 && total_units >= 2);
 
-        if (nthreads <= 1)
+#if defined(GRIZZLAR_USE_EXECUTION)
+        if (do_parallel_scatter)
         {
-            for (size_t u = 0; u < total_units; ++u)
-                scatter_unit(u);
+            std::vector<size_t> all_tasks(total_units);
+            std::iota(all_tasks.begin(), all_tasks.end(), 0);
+            std::for_each(std::execution::par, all_tasks.begin(), all_tasks.end(),
+                [&](size_t u) { scatter_unit(u); });
         }
         else
         {
-            const size_t upt = (total_units + nthreads - 1) / nthreads;
-            std::vector<std::future<void>> futs;
-            futs.reserve(nthreads);
-            for (size_t t = 0; t < nthreads; ++t)
-            {
-                size_t us = t * upt, ue = std::min(us + upt, total_units);
-                if (us >= total_units)
-                    break;
-                futs.push_back(std::async(std::launch::async,
-                                          [us, ue, &scatter_unit]()
-                                          {
-                                              for (size_t u = us; u < ue; ++u)
-                                                  scatter_unit(u);
-                                          }));
-            }
-            for (auto &f : futs)
-                f.wait();
+            for (size_t u = 0; u < total_units; ++u) scatter_unit(u);
         }
+#else
+        for (size_t u = 0; u < total_units; ++u) scatter_unit(u);
+#endif
 
         out.df_.load_index(std::move(new_idx));
         for (size_t ci = 0; ci < nleft + nright; ++ci)
@@ -2232,9 +2514,60 @@ public:
                 out.df_.load_column<int64_t>(cname.c_str(), std::move(col_bufs[ci].ints));
             else if (type == "bool")
                 out.df_.load_column<bool>(cname.c_str(), std::move(col_bufs[ci].bools));
-            else
-                out.df_.load_column<std::string>(cname.c_str(), std::move(col_bufs[ci].strs));
+            // string cols scattered below
         }
+        // Scatter string columns using flat-buffer scatter_join
+        // Collect (column_name, side) pairs for string cols so we can parallelise
+        struct StrTask { std::string name; bool is_right; };
+        std::vector<StrTask> str_tasks;
+        for (size_t ci = 0; ci < nleft; ++ci)
+        {
+            const auto &cname = col_order_[ci];
+            if (col_types_.at(cname) == "string")
+                str_tasks.push_back({cname, false});
+        }
+        for (size_t ci = 0; ci < nright; ++ci)
+        {
+            const auto &cname = rhs.col_order_[ci];
+            if (rhs.col_types_.at(cname) == "string")
+                str_tasks.push_back({cname, true});
+        }
+
+        // Pre-allocate result slots so parallel writes go to independent locations
+        const size_t n_str = str_tasks.size();
+        std::vector<StringArray> str_results(n_str);
+
+#if defined(GRIZZLAR_USE_EXECUTION)
+        if (do_parallel_scatter && n_str >= 2)
+        {
+            std::vector<size_t> str_ids(n_str);
+            std::iota(str_ids.begin(), str_ids.end(), 0);
+            std::for_each(std::execution::par, str_ids.begin(), str_ids.end(),
+                [&](size_t i) {
+                    const auto &t = str_tasks[i];
+                    if (!t.is_right)
+                        str_results[i] = str_cols_.at(t.name).scatter_join(left_pos, NO_MATCH);
+                    else
+                        str_results[i] = rhs.str_cols_.at(t.name).scatter_join(right_pos, NO_MATCH);
+                });
+        }
+        else
+        {
+#endif
+            for (size_t i = 0; i < n_str; ++i)
+            {
+                const auto &t = str_tasks[i];
+                if (!t.is_right)
+                    str_results[i] = str_cols_.at(t.name).scatter_join(left_pos, NO_MATCH);
+                else
+                    str_results[i] = rhs.str_cols_.at(t.name).scatter_join(right_pos, NO_MATCH);
+            }
+#if defined(GRIZZLAR_USE_EXECUTION)
+        }
+#endif
+
+        for (size_t i = 0; i < n_str; ++i)
+            out.str_cols_[str_tasks[i].name] = std::move(str_results[i]);
         return out;
     }
 
@@ -2297,13 +2630,7 @@ public:
             }
             else
             {
-                const auto &a = df_.get_column<std::string>(name.c_str());
-                const auto &b = other.df_.get_column<std::string>(name.c_str());
-                std::vector<std::string> combined;
-                combined.reserve(total);
-                combined.insert(combined.end(), a.begin(), a.end());
-                combined.insert(combined.end(), b.begin(), b.end());
-                out.df_.load_column<std::string>(name.c_str(), std::move(combined));
+                out.str_cols_[name] = str_cols_.at(name).concat_with(other.str_cols_.at(name));
             }
         }
         return out;
@@ -2339,9 +2666,9 @@ public:
         else if (type == "string")
         {
             std::unordered_set<std::string> seen;
-            const auto &v = df_.get_column<std::string>(col.c_str());
-            for (size_t i = 0; i < v.size(); ++i)
-                if (seen.insert(v[i]).second)
+            const StringArray &sa = str_cols_.at(col);
+            for (size_t i = 0; i < sa.size(); ++i)
+                if (seen.emplace(sa.str(i)).second)
                     keep.push_back(i);
         }
         else
@@ -2381,9 +2708,9 @@ public:
         }
         else if (type == "string")
         {
-            const auto &v = df_.get_column<std::string>(col.c_str());
-            for (size_t i = 0; i < v.size(); ++i)
-                if (!v[i].empty())
+            const StringArray &sa = str_cols_.at(col);
+            for (size_t i = 0; i < sa.size(); ++i)
+                if (!sa.view(i).empty())
                     keep.push_back(i);
         }
         else
@@ -2414,10 +2741,7 @@ public:
         else if (type == "string")
         {
             std::string fill = py::cast<std::string>(value);
-            auto &v = df_.get_column<std::string>(col.c_str());
-            for (auto &x : v)
-                if (x.empty())
-                    x = fill;
+            str_cols_[col] = str_cols_.at(col).with_fillna(fill);
         }
     }
 
@@ -2429,10 +2753,18 @@ public:
             throw std::runtime_error("Column not found: " + old_name);
         if (col_types_.count(new_name))
             throw std::runtime_error("Column already exists: " + new_name);
-        df_.rename_column(old_name.c_str(), new_name.c_str());
         std::string type = it->second;
         col_types_.erase(it);
         col_types_[new_name] = type;
+        if (type == "string")
+        {
+            str_cols_[new_name] = std::move(str_cols_.at(old_name));
+            str_cols_.erase(old_name);
+        }
+        else
+        {
+            df_.rename_column(old_name.c_str(), new_name.c_str());
+        }
         for (auto &n : col_order_)
             if (n == old_name)
             {
@@ -2455,7 +2787,7 @@ public:
         else if (type == "bool")
             df_.remove_column<bool>(name.c_str());
         else
-            df_.remove_column<std::string>(name.c_str());
+            str_cols_.erase(name);
         col_types_.erase(it);
         col_order_.erase(std::remove(col_order_.begin(), col_order_.end(), name), col_order_.end());
     }
@@ -2502,8 +2834,11 @@ public:
         }
         else if (type == "string")
         {
-            const auto &v = df_.get_column<std::string>(col.c_str());
-            add_counts(v);
+            const StringArray &sa = str_cols_.at(col);
+            std::map<std::string, int64_t> m;
+            for (size_t i = 0; i < sa.size(); ++i)
+                m[std::string(sa.view(i))]++;
+            for (auto &[k, cv] : m) { keys.push_back(k); cnts.push_back(cv); }
         }
         else
         {
@@ -2541,7 +2876,7 @@ public:
         }
         out.col_order_ = {"value", "count"};
         out.col_types_ = {{"value", "string"}, {"count", "int64"}};
-        out.df_.load_column<std::string>("value", std::move(sk));
+        out.str_cols_["value"] = StringArray::from_strvec(std::move(sk));
         out.df_.load_column<int64_t>("count", std::move(sc));
         return out;
     }
@@ -2572,8 +2907,10 @@ public:
         py::list lst;
         if (type == "string")
         {
-            const auto &v = df_.get_column<std::string>(col.c_str());
-            std::set<std::string> s(v.begin(), v.end());
+            const StringArray &sa = str_cols_.at(col);
+            std::set<std::string> s;
+            for (size_t i = 0; i < sa.size(); ++i)
+                s.insert(sa.str(i));
             for (const auto &x : s)
                 lst.append(py::str(x));
         }
@@ -2614,8 +2951,11 @@ public:
         }
         if (type == "string")
         {
-            const auto &v = df_.get_column<std::string>(col.c_str());
-            return std::set<std::string>(v.begin(), v.end()).size();
+            const StringArray &sa = str_cols_.at(col);
+            std::unordered_set<std::string_view> s;
+            for (size_t i = 0; i < sa.size(); ++i)
+                s.insert(sa.view(i));
+            return s.size();
         }
         const auto &v = df_.get_column<bool>(col.c_str());
         bool ht = false, hf = false;
@@ -2642,9 +2982,11 @@ public:
         }
         if (it->second == "string")
         {
-            const auto &v = df_.get_column<std::string>(col.c_str());
-            return static_cast<size_t>(std::count_if(v.begin(), v.end(), [](const std::string &s)
-                                                     { return s.empty(); }));
+            const StringArray &sa = str_cols_.at(col);
+            size_t cnt = 0;
+            for (size_t i = 0; i < sa.size(); ++i)
+                if (sa.view(i).empty()) ++cnt;
+            return cnt;
         }
         return 0;
     }
@@ -2735,10 +3077,9 @@ public:
             }
             else
             {
-                const auto &v = df_.get_column<std::string>(name.c_str());
-                std::vector<std::string> nv(n);
-                for (size_t j = 0; j < n; ++j) { int64_t r = indices[j]; size_t p = r >= 0 ? (size_t)r : (size_t)((int64_t)src_n + r); nv[j] = v[p]; }
-                out.df_.load_column<std::string>(name.c_str(), std::move(nv));
+                std::vector<size_t> locs(n);
+                for (size_t j = 0; j < n; ++j) { int64_t r = indices[j]; locs[j] = r >= 0 ? (size_t)r : (size_t)((int64_t)src_n + r); }
+                out.str_cols_[name] = str_cols_.at(name).gather(locs.data(), n);
             }
         }
         return out;
@@ -2768,9 +3109,9 @@ public:
             }
             else if (type == "string")
             {
-                const auto &v = df_.get_column<std::string>(name.c_str());
-                for (size_t i = 0; i < v.size(); ++i)
-                    bv[i] = v[i].empty();
+                const StringArray &sa = str_cols_.at(name);
+                for (size_t i = 0; i < sa.size(); ++i)
+                    bv[i] = sa.view(i).empty();
             }
             // int64/bool: always false
             out.df_.load_column<bool>(name.c_str(), std::move(bv));
@@ -2800,9 +3141,9 @@ public:
             }
             else if (type == "string")
             {
-                const auto &v = df_.get_column<std::string>(name.c_str());
-                for (size_t i = 0; i < v.size(); ++i)
-                    bv[i] = !v[i].empty();
+                const StringArray &sa = str_cols_.at(name);
+                for (size_t i = 0; i < sa.size(); ++i)
+                    bv[i] = !sa.view(i).empty();
             }
             // int64/bool: always true
             out.df_.load_column<bool>(name.c_str(), std::move(bv));
@@ -2830,15 +3171,17 @@ public:
         }
         else if (it->second == "string")
         {
-            auto &v = df_.get_column<std::string>(col.c_str());
-            std::string last;
-            for (auto &x : v)
+            StringArray &sa = str_cols_.at(col);
+            StringArray out;
+            std::string_view last;
+            for (size_t i = 0; i < sa.size(); ++i)
             {
-                if (!x.empty())
-                    last = x;
-                else if (!last.empty())
-                    x = last;
+                auto v = sa.view(i);
+                if (!v.empty()) last = v;
+                else if (!last.empty()) v = last;
+                out.push_back(v);
             }
+            sa = std::move(out);
         }
     }
 
@@ -2862,15 +3205,19 @@ public:
         }
         else if (it->second == "string")
         {
-            auto &v = df_.get_column<std::string>(col.c_str());
-            std::string nxt;
-            for (int64_t i = static_cast<int64_t>(v.size()) - 1; i >= 0; --i)
+            StringArray &sa = str_cols_.at(col);
+            const int64_t sz = static_cast<int64_t>(sa.size());
+            std::vector<std::string_view> vals(static_cast<size_t>(sz));
+            std::string_view nxt;
+            for (int64_t i = sz - 1; i >= 0; --i)
             {
-                if (!v[i].empty())
-                    nxt = v[i];
-                else if (!nxt.empty())
-                    v[i] = nxt;
+                auto v = sa.view(static_cast<size_t>(i));
+                if (!v.empty()) nxt = v;
+                vals[static_cast<size_t>(i)] = !v.empty() ? v : nxt;
             }
+            StringArray out;
+            for (auto sv : vals) out.push_back(sv);
+            sa = std::move(out);
         }
     }
 
@@ -2990,10 +3337,10 @@ public:
             std::unordered_set<std::string> val_set;
             for (auto item : py::cast<py::iterable>(values))
                 val_set.insert(py::cast<std::string>(item));
-            const auto &v = df_.get_column<std::string>(col.c_str());
-            result.reserve(v.size());
-            for (const auto &x : v)
-                result.push_back(val_set.count(x) > 0);
+            const StringArray &sa = str_cols_.at(col);
+            result.reserve(sa.size());
+            for (size_t i = 0; i < sa.size(); ++i)
+                result.push_back(val_set.count(std::string(sa.view(i))) > 0);
         }
         else
         {
@@ -3046,13 +3393,7 @@ public:
             std::unordered_map<std::string, std::string> m;
             for (auto item : mapping)
                 m[py::cast<std::string>(item.first)] = py::cast<std::string>(item.second);
-            auto &v = df_.get_column<std::string>(col.c_str());
-            for (auto &x : v)
-            {
-                auto mi = m.find(x);
-                if (mi != m.end())
-                    x = mi->second;
-            }
+            str_cols_[col] = str_cols_.at(col).with_replace(m);
         }
     }
 
@@ -3444,8 +3785,8 @@ public:
         }
         else if (type == "string")
         {
-            const auto &v = df_.get_column<std::string>(col.c_str());
-            compute_mode_str(v);
+            auto sv = str_cols_.at(col).to_strvec();
+            compute_mode_str(sv);
         }
         return result;
     }
@@ -3477,8 +3818,7 @@ public:
                 }
                 else if (type == "string")
                 {
-                    const auto &v = df_.get_column<std::string>(c.c_str());
-                    k += v[i] + "|";
+                    k += std::string(str_cols_.at(c).view(i)) + "|";
                 }
                 else
                 {
@@ -3573,11 +3913,11 @@ public:
             }
             else
             {
-                const auto &src = df_.get_column<std::string>(ic.c_str());
-                std::vector<std::string> nv; nv.reserve(out_n);
+                const StringArray &src = str_cols_.at(ic);
+                StringArray nv;
                 for (size_t vc_i = 0; vc_i < val_cols.size(); ++vc_i)
-                    for (size_t r = 0; r < n; ++r) nv.push_back(src[r]);
-                out.df_.load_column<std::string>(ic.c_str(), std::move(nv));
+                    for (size_t r = 0; r < n; ++r) nv.push_back(src.view(r));
+                out.str_cols_[ic] = std::move(nv);
             }
         }
 
@@ -3587,7 +3927,7 @@ public:
         std::vector<std::string> var_col; var_col.reserve(out_n);
         for (const auto &vc : val_cols)
             for (size_t r = 0; r < n; ++r) var_col.push_back(vc);
-        out.df_.load_column<std::string>(var_name.c_str(), std::move(var_col));
+        out.str_cols_[var_name] = StringArray::from_strvec(std::move(var_col));
 
         // value column — use double as common type
         out.col_order_.push_back(value_name);
@@ -3729,7 +4069,7 @@ public:
                 else if (type == "bool")
                     rebuilt.df_.load_column<bool>(nm.c_str(), df_.get_column<bool>(nm.c_str()));
                 else
-                    rebuilt.df_.load_column<std::string>(nm.c_str(), df_.get_column<std::string>(nm.c_str()));
+                    rebuilt.str_cols_[nm] = str_cols_.at(nm);
             }
             return rebuilt;
         }
@@ -3756,10 +4096,10 @@ public:
             std::vector<double> nv(n, nan);
             if (src_type == "int64") { const auto &v = df_.get_column<int64_t>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=static_cast<double>(v[i]); }
             else if (src_type == "bool") { const auto &v = df_.get_column<bool>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=v[i]?1.0:0.0; }
-            else if (src_type == "string") { const auto &v = df_.get_column<std::string>(col.c_str()); char *e; for (size_t i=0;i<n;++i) { double d=std::strtod(v[i].c_str(),&e); nv[i]=(e!=v[i].c_str())?d:nan; } }
+            else if (src_type == "string") { const StringArray &sa = str_cols_.at(col); for (size_t i=0;i<n;++i) { auto s=sa.str(i); char *e; double d=std::strtod(s.c_str(),&e); nv[i]=(e!=s.c_str())?d:nan; } }
             if (src_type == "int64") df_.remove_column<int64_t>(col.c_str());
             else if (src_type == "bool") df_.remove_column<bool>(col.c_str());
-            else if (src_type == "string") df_.remove_column<std::string>(col.c_str());
+            else if (src_type == "string") str_cols_.erase(col);
             df_.load_column<double>(col.c_str(), std::move(nv));
             col_types_[col] = "double";
         }
@@ -3768,10 +4108,10 @@ public:
             std::vector<int64_t> nv(n, 0);
             if (src_type == "double") { const auto &v = df_.get_column<double>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=static_cast<int64_t>(v[i]); }
             else if (src_type == "bool") { const auto &v = df_.get_column<bool>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=v[i]?1:0; }
-            else if (src_type == "string") { const auto &v = df_.get_column<std::string>(col.c_str()); char *e; for (size_t i=0;i<n;++i) { long long d=std::strtoll(v[i].c_str(),&e,10); nv[i]=(e!=v[i].c_str())?static_cast<int64_t>(d):0; } }
+            else if (src_type == "string") { const StringArray &sa = str_cols_.at(col); for (size_t i=0;i<n;++i) { auto s=sa.str(i); char *e; long long d=std::strtoll(s.c_str(),&e,10); nv[i]=(e!=s.c_str())?static_cast<int64_t>(d):0; } }
             if (src_type == "double") df_.remove_column<double>(col.c_str());
             else if (src_type == "bool") df_.remove_column<bool>(col.c_str());
-            else if (src_type == "string") df_.remove_column<std::string>(col.c_str());
+            else if (src_type == "string") str_cols_.erase(col);
             df_.load_column<int64_t>(col.c_str(), std::move(nv));
             col_types_[col] = "int64";
         }
@@ -3784,7 +4124,7 @@ public:
             if (src_type == "double") df_.remove_column<double>(col.c_str());
             else if (src_type == "int64") df_.remove_column<int64_t>(col.c_str());
             else if (src_type == "bool") df_.remove_column<bool>(col.c_str());
-            df_.load_column<std::string>(col.c_str(), std::move(nv));
+            str_cols_[col] = StringArray::from_strvec(std::move(nv));
             col_types_[col] = "string";
         }
         else if (target_type == "bool")
@@ -3792,10 +4132,10 @@ public:
             std::vector<bool> nv(n, false);
             if (src_type == "double") { const auto &v = df_.get_column<double>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=(v[i]!=0.0&&!std::isnan(v[i])); }
             else if (src_type == "int64") { const auto &v = df_.get_column<int64_t>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=(v[i]!=0); }
-            else if (src_type == "string") { const auto &v = df_.get_column<std::string>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=(!v[i].empty()&&v[i]!="false"&&v[i]!="0"); }
+            else if (src_type == "string") { const StringArray &sa = str_cols_.at(col); for (size_t i=0;i<n;++i) { auto sv=sa.view(i); nv[i]=(!sv.empty()&&sv!="false"&&sv!="0"); } }
             if (src_type == "double") df_.remove_column<double>(col.c_str());
             else if (src_type == "int64") df_.remove_column<int64_t>(col.c_str());
-            else if (src_type == "string") df_.remove_column<std::string>(col.c_str());
+            else if (src_type == "string") str_cols_.erase(col);
             df_.load_column<bool>(col.c_str(), std::move(nv));
             col_types_[col] = "bool";
         }
@@ -3852,7 +4192,7 @@ public:
         // Leading label column
         out.col_order_.push_back("");
         out.col_types_[""] = "string";
-        out.df_.load_column<std::string>("", std::vector<std::string>(num_cols.begin(), num_cols.end()));
+        out.str_cols_[""] = StringArray::from_strvec(std::vector<std::string>(num_cols.begin(), num_cols.end()));
 
         for (size_t i = 0; i < k; ++i)
         {
@@ -3887,7 +4227,7 @@ public:
 
         out.col_order_.push_back("");
         out.col_types_[""] = "string";
-        out.df_.load_column<std::string>("", std::vector<std::string>(num_cols.begin(), num_cols.end()));
+        out.str_cols_[""] = StringArray::from_strvec(std::vector<std::string>(num_cols.begin(), num_cols.end()));
 
         for (size_t i = 0; i < k; ++i)
         {
@@ -3905,16 +4245,238 @@ public:
     // 28. filter_by_mask_list — filter using vector<bool> (no numpy required)
     GrizzlarFrame filter_by_mask_list(const std::vector<bool> &mask) const
     {
-        const auto &idx = df_.get_index();
-        const size_t n = idx.size();
+        const size_t n = df_.get_index().size();
         if (mask.size() != n)
             throw std::runtime_error("mask length " + std::to_string(mask.size()) +
                                      " != frame length " + std::to_string(n));
-        std::vector<size_t> locs;
-        locs.reserve(n);
-        for (size_t i = 0; i < n; ++i)
-            if (mask[i]) locs.push_back(i);
-        return extract_rows_parallel(locs);
+        std::vector<uint8_t> m(n);
+        size_t out_n = 0;
+        for (size_t i = 0; i < n; ++i) { m[i] = mask[i] ? 1 : 0; out_n += m[i]; }
+        if (out_n == n) return deep_copy();
+        return compress_by_uint8(m.data(), n, out_n);
+    }
+
+    // 28b. describe_col / _describe_raw — one copy + one sort per column.
+    //      _describe_raw is pure C++ (no pybind11 objects) so it is safe to call
+    //      from threads without the GIL.  describe() launches all numeric columns
+    //      in parallel and assembles the result dict after re-acquiring the GIL.
+
+    struct DescribeStats {
+        double count, mean, std_v, min_v, q25, q50, q75, max_v;
+    };
+
+    DescribeStats _describe_raw(const std::string &col) const
+    {
+        const std::string &type = col_types_.at(col);
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+
+        std::vector<double> vals;
+        if (type == "double")
+        {
+            const auto &v = df_.get_column<double>(col.c_str());
+            vals.reserve(v.size());
+            for (double x : v)
+                if (!std::isnan(x)) vals.push_back(x);
+        }
+        else
+        {
+            const auto &v = df_.get_column<int64_t>(col.c_str());
+            vals.reserve(v.size());
+            for (int64_t x : v) vals.push_back(static_cast<double>(x));
+        }
+
+        const size_t cnt = vals.size();
+        if (cnt == 0) return {0.0, nan, nan, nan, nan, nan, nan, nan};
+
+        double sum_v = 0, sum_sq = 0;
+        double mn =  std::numeric_limits<double>::infinity();
+        double mx = -std::numeric_limits<double>::infinity();
+        for (double v : vals) { sum_v += v; sum_sq += v * v; if (v < mn) mn = v; if (v > mx) mx = v; }
+        double mean_v = sum_v / cnt;
+        double var    = cnt > 1 ? (sum_sq - sum_v * sum_v / cnt) / (cnt - 1) : 0.0;
+        double std_v  = cnt > 1 ? std::sqrt(var) : 0.0;
+
+        std::sort(vals.begin(), vals.end());
+        auto interp = [&](double q) -> double {
+            double pos = q * (cnt - 1);
+            size_t lo  = static_cast<size_t>(pos);
+            double frac = pos - lo;
+            return (lo + 1 < cnt) ? vals[lo] + frac * (vals[lo + 1] - vals[lo]) : vals[lo];
+        };
+        return {static_cast<double>(cnt), mean_v, std_v, mn,
+                interp(0.25), interp(0.50), interp(0.75), mx};
+    }
+
+    py::dict describe_col(const std::string &col) const
+    {
+        require_numeric(col);
+        const auto r = _describe_raw(col);
+        py::dict d;
+        d["count"] = r.count; d["mean"]  = r.mean;  d["std"]  = r.std_v;
+        d["min"]   = r.min_v; d["25%"]   = r.q25;   d["50%"]  = r.q50;
+        d["75%"]   = r.q75;   d["max"]   = r.max_v;
+        return d;
+    }
+
+    // 29. multi_stat_col — compute count/mean/std/min/max/sum in one C++ pass.
+    //     Returns a Python dict.  Cuts the pybind11 call overhead from 10 to 1
+    //     compared with calling mean()/sum()/std()/min()/max() separately.
+    py::dict multi_stat_col(const std::string &col) const
+    {
+        require_numeric(col);
+        const std::string &type = col_types_.at(col);
+        const size_t n = df_.get_index().size();
+        const double inf  =  std::numeric_limits<double>::infinity();
+        const double nan  =  std::numeric_limits<double>::quiet_NaN();
+
+        double sum_v = 0, sum_sq = 0, min_v = inf, max_v = -inf;
+        size_t cnt = 0;
+
+        // Fast path: scan for NaN first (vectorizable single pass).
+        // Real-world numeric columns (sales, prices, volumes) rarely contain NaN,
+        // so the no-NaN branch runs as a tight branchless loop that MSVC /arch:AVX2
+        // can auto-vectorize to VADDPD / VMULPD / VMINPD / VMAXPD.
+        if (type == "double")
+        {
+            const auto &raw = df_.get_column<double>(col.c_str());
+            bool has_nan = false;
+            for (size_t i = 0; i < n && !has_nan; ++i) has_nan = std::isnan(raw[i]);
+
+            if (!has_nan)
+            {
+                cnt = n;
+                for (size_t i = 0; i < n; ++i)
+                {
+                    sum_v  += raw[i];
+                    sum_sq += raw[i] * raw[i];
+                    if (raw[i] < min_v) min_v = raw[i];
+                    if (raw[i] > max_v) max_v = raw[i];
+                }
+            }
+            else
+            {
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const double v = raw[i];
+                    if (!std::isnan(v)) { ++cnt; sum_v += v; sum_sq += v * v; if (v < min_v) min_v = v; if (v > max_v) max_v = v; }
+                }
+            }
+        }
+        else // int64 — no NaN sentinel in range we expose; process all
+        {
+            cnt = n;
+            for (int64_t v : df_.get_column<int64_t>(col.c_str()))
+            {
+                const double d = static_cast<double>(v);
+                sum_v  += d; sum_sq += d * d;
+                if (d < min_v) min_v = d;
+                if (d > max_v) max_v = d;
+            }
+        }
+
+        const double dcnt = static_cast<double>(cnt);
+        double mean_v = cnt ? sum_v / dcnt : nan;
+        double var_v  = cnt > 1 ? (sum_sq - sum_v * sum_v / dcnt) / (dcnt - 1) : 0.0;
+        double std_v  = cnt > 1 ? std::sqrt(var_v) : 0.0;
+
+        py::dict d;
+        d["count"] = dcnt;
+        d["mean"]  = mean_v;
+        d["std"]   = std_v;
+        d["min"]   = cnt ? min_v : nan;
+        d["max"]   = cnt ? max_v : nan;
+        d["sum"]   = sum_v;
+        return d;
+    }
+
+    // 30. compare_col_scalar — return a bool mask for col op scalar entirely in C++
+    //     Avoids materializing 100K Python objects for the comparison step.
+    std::vector<bool> compare_col_scalar(const std::string &col,
+                                         const std::string &op,
+                                         double scalar) const
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        const std::string &type = it->second;
+        const size_t n = df_.get_index().size();
+        std::vector<bool> mask(n, false);
+
+        if (type == "double")
+        {
+            const auto &v = df_.get_column<double>(col.c_str());
+            if (op == ">")       for (size_t i = 0; i < n; ++i) mask[i] = v[i] > scalar;
+            else if (op == ">=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] >= scalar;
+            else if (op == "<")  for (size_t i = 0; i < n; ++i) mask[i] = v[i] < scalar;
+            else if (op == "<=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] <= scalar;
+            else if (op == "==") for (size_t i = 0; i < n; ++i) mask[i] = v[i] == scalar;
+            else if (op == "!=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] != scalar;
+        }
+        else if (type == "int64")
+        {
+            int64_t s = static_cast<int64_t>(scalar);
+            const auto &v = df_.get_column<int64_t>(col.c_str());
+            if (op == ">")       for (size_t i = 0; i < n; ++i) mask[i] = v[i] > s;
+            else if (op == ">=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] >= s;
+            else if (op == "<")  for (size_t i = 0; i < n; ++i) mask[i] = v[i] < s;
+            else if (op == "<=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] <= s;
+            else if (op == "==") for (size_t i = 0; i < n; ++i) mask[i] = v[i] == s;
+            else if (op == "!=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] != s;
+        }
+        else
+        {
+            throw std::runtime_error("compare_col_scalar: unsupported type " + type);
+        }
+        return mask;
+    }
+
+    // 30. filter_col_scalar — compare column vs scalar, compress-filter all columns.
+    //     Uses uint8_t mask + compress_by_uint8 — no per-row string heap allocation.
+    GrizzlarFrame filter_col_scalar(const std::string &col,
+                                     const std::string &op,
+                                     double scalar) const
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        const std::string &type = it->second;
+        const size_t n = df_.get_index().size();
+
+        std::vector<uint8_t> mask(n, 0);
+
+        if (type == "double")
+        {
+            const double *v = df_.get_column<double>(col.c_str()).data();
+            if (op == ">")       for (size_t i = 0; i < n; ++i) mask[i] = v[i] > scalar;
+            else if (op == ">=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] >= scalar;
+            else if (op == "<")  for (size_t i = 0; i < n; ++i) mask[i] = v[i] < scalar;
+            else if (op == "<=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] <= scalar;
+            else if (op == "==") for (size_t i = 0; i < n; ++i) mask[i] = v[i] == scalar;
+            else if (op == "!=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] != scalar;
+            else throw std::runtime_error("filter_col_scalar: unknown op: " + op);
+        }
+        else if (type == "int64")
+        {
+            int64_t s = static_cast<int64_t>(scalar);
+            const int64_t *v = df_.get_column<int64_t>(col.c_str()).data();
+            if (op == ">")       for (size_t i = 0; i < n; ++i) mask[i] = v[i] > s;
+            else if (op == ">=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] >= s;
+            else if (op == "<")  for (size_t i = 0; i < n; ++i) mask[i] = v[i] < s;
+            else if (op == "<=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] <= s;
+            else if (op == "==") for (size_t i = 0; i < n; ++i) mask[i] = v[i] == s;
+            else if (op == "!=") for (size_t i = 0; i < n; ++i) mask[i] = v[i] != s;
+            else throw std::runtime_error("filter_col_scalar: unknown op: " + op);
+        }
+        else
+        {
+            throw std::runtime_error("filter_col_scalar: unsupported type " + type +
+                                     " (only double/int64 supported)");
+        }
+
+        size_t out_n = 0;
+        for (size_t i = 0; i < n; ++i) out_n += mask[i];
+        if (out_n == n) return deep_copy();
+        return compress_by_uint8(mask.data(), n, out_n);
     }
 
 private:
@@ -3941,15 +4503,15 @@ private:
         }
         else
         {
-            const auto &v = df_.get_column<std::string>(col.c_str());
-            if (row < v.size())
+            const StringArray &sa = str_cols_.at(col);
+            if (row < sa.size())
             {
-                const std::string &s = v[row];
-                bool nq = s.find(',') != std::string::npos || s.find('"') != std::string::npos || s.find('\n') != std::string::npos;
+                auto sv = sa.view(row);
+                bool nq = sv.find(',') != std::string_view::npos || sv.find('"') != std::string_view::npos || sv.find('\n') != std::string_view::npos;
                 if (nq)
                 {
                     out << '"';
-                    for (char ch : s)
+                    for (char ch : sv)
                     {
                         if (ch == '"')
                             out << '"';
@@ -3958,7 +4520,7 @@ private:
                     out << '"';
                 }
                 else
-                    out << s;
+                    out << sv;
             }
         }
     }
@@ -4058,7 +4620,13 @@ PYBIND11_MODULE(_grizzlars, m)
         .def("corr_matrix", &GrizzlarFrame::corr_matrix)
         .def("cov_matrix", &GrizzlarFrame::cov_matrix)
         .def("filter_by_mask_list", &GrizzlarFrame::filter_by_mask_list, py::arg("mask"))
-        .def("take_rows", &GrizzlarFrame::take_rows, py::arg("indices"));
+        .def("take_rows", &GrizzlarFrame::take_rows, py::arg("indices"))
+        .def("compare_col_scalar", &GrizzlarFrame::compare_col_scalar,
+             py::arg("col"), py::arg("op"), py::arg("scalar"))
+        .def("filter_col_scalar", &GrizzlarFrame::filter_col_scalar,
+             py::arg("col"), py::arg("op"), py::arg("scalar"))
+        .def("multi_stat_col", &GrizzlarFrame::multi_stat_col, py::arg("col"))
+        .def("describe_col", &GrizzlarFrame::describe_col, py::arg("col"));
 
     // Thread-pool controls
     m.def("set_thread_level", [](long n)

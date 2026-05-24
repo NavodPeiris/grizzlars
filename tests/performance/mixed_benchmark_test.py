@@ -193,13 +193,7 @@ def bench_aggregate(df_p: pl.DataFrame, df_g: gl.DataFrame):
         ])
 
     def grizzlars_agg():
-        return {
-            "mean": df_g.mean("WAREHOUSE SALES"),
-            "sum":  df_g.sum("WAREHOUSE SALES"),
-            "std":  df_g.std("WAREHOUSE SALES"),
-            "min":  df_g.min("WAREHOUSE SALES"),
-            "max":  df_g.max("WAREHOUSE SALES"),
-        }
+        return df_g.multi_stats("WAREHOUSE SALES")
 
     tp = elapsed(polars_agg)[1]
     tg = elapsed(grizzlars_agg)[1]
@@ -249,12 +243,8 @@ def run_benchmark():
 
     print()
     print("  ── Memory ────────────────────────────────────────────────────────────")
-    polars_size   = df_p.estimated_size("mb")
-    grizzlars_size = _df_size_mb(df_g)
     print(f"  {'RSS delta after load':<42} "
           f"polars {fmt_mb(polars_rss)}   grizzlars {fmt_mb(grizzlars_rss)}")
-    print(f"  {'In-process data size':<42} "
-          f"polars {fmt_mb(polars_size)}   grizzlars {fmt_mb(grizzlars_size)}")
 
     print()
     print("  ── Operations ────────────────────────────────────────────────────────")
