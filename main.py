@@ -32,7 +32,7 @@ def main() -> None:
     print(df.sort_index().head(3))
 
     print("\n── dtypes ─────────────────────────────────")
-    for col, t in df.dtypes().items():
+    for col, t in df.dtypes.items():
         print(f"  {col}: {t}")
 
     # Round-trip to CSV
