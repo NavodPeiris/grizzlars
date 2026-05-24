@@ -12,3 +12,4 @@ output.csv
 
 # Test cache
 .pytest_cache/
+pandas-stubs
