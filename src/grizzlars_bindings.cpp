@@ -578,6 +578,18 @@ public:
         return out;
     }
 
+    // Returns true for string values that pandas treats as NaN by default.
+    static bool is_na_string(const std::string &s)
+    {
+        // Matches pandas default na_values set (case-sensitive subset that matters most)
+        static const std::unordered_set<std::string> na_tokens = {
+            "", "None", "none", "nan", "NaN", "NA", "N/A", "n/a", "na",
+            "NULL", "null", "Null", "#N/A", "#NA", "<NA>", "-NaN", "-nan",
+            "1.#IND", "1.#QNAN", "-1.#IND", "-1.#QNAN", "#N/A N/A"
+        };
+        return na_tokens.count(s) > 0;
+    }
+
     // Native C++ CSV reader — multi-threaded, reads entire file at once.
     //
     // Algorithm:
@@ -767,14 +779,14 @@ public:
                                                          {
                                                          case 0:
                                                          {
-                                                             int64_t x = 0;
+                                                             int64_t x = std::numeric_limits<int64_t>::min();
                                                              csv_try_int64(row[c].c_str(), row[c].size(), x);
                                                              r.cols[c].ints.push_back(x);
                                                              break;
                                                          }
                                                          case 1:
                                                          {
-                                                             double x = 0;
+                                                             double x = std::numeric_limits<double>::quiet_NaN();
                                                              csv_try_double(row[c].c_str(), row[c].size(), x);
                                                              r.cols[c].dbls.push_back(x);
                                                              break;
@@ -782,7 +794,8 @@ public:
                                                          // Move from row buffer — parse_csv_row_fast clears row on
                                                          // the next call, so the moved-from state is safe to destroy.
                                                          case 2:
-                                                             r.cols[c].strs.push_back(std::move(row[c]));
+                                                             r.cols[c].strs.push_back(
+                                                                 is_na_string(row[c]) ? std::string{} : std::move(row[c]));
                                                              break;
                                                          }
                                                      }
@@ -863,10 +876,26 @@ public:
             out.col_order_.push_back(nm);
             switch (merged[c].type_id)
             {
-            case 0:
-                out.col_types_[nm] = "int64";
-                out.df_.load_column<int64_t>(nm.c_str(), std::move(merged[c].ints));
+            case 0: {
+                auto &ints = merged[c].ints;
+                const int64_t missing_sentinel = std::numeric_limits<int64_t>::min();
+                bool has_missing = std::any_of(ints.begin(), ints.end(),
+                    [missing_sentinel](int64_t v) { return v == missing_sentinel; });
+                if (has_missing) {
+                    out.col_types_[nm] = "double";
+                    std::vector<double> dbls;
+                    dbls.reserve(ints.size());
+                    for (int64_t v : ints)
+                        dbls.push_back(v == missing_sentinel
+                            ? std::numeric_limits<double>::quiet_NaN()
+                            : static_cast<double>(v));
+                    out.df_.load_column<double>(nm.c_str(), std::move(dbls));
+                } else {
+                    out.col_types_[nm] = "int64";
+                    out.df_.load_column<int64_t>(nm.c_str(), std::move(ints));
+                }
                 break;
+            }
             case 1:
                 out.col_types_[nm] = "double";
                 out.df_.load_column<double>(nm.c_str(), std::move(merged[c].dbls));
@@ -2662,6 +2691,1232 @@ public:
         }
     }
 
+    // take_rows — select rows by integer position in arbitrary order (fast path for sklearn)
+    GrizzlarFrame take_rows(const std::vector<int64_t> &indices) const
+    {
+        size_t n = indices.size();
+        size_t src_n = df_.get_index().size();
+        GrizzlarFrame out;
+        const auto &src_idx = df_.get_index();
+        std::vector<ulong> new_idx(n);
+        for (size_t j = 0; j < n; ++j)
+        {
+            int64_t raw = indices[j];
+            size_t pos = (raw >= 0) ? static_cast<size_t>(raw)
+                                    : static_cast<size_t>(static_cast<int64_t>(src_n) + raw);
+            new_idx[j] = src_idx[pos];
+        }
+        out.df_.load_index(std::move(new_idx));
+        for (const auto &name : col_order_)
+        {
+            const std::string &type = col_types_.at(name);
+            out.col_types_[name] = type;
+            out.col_order_.push_back(name);
+            if (type == "double")
+            {
+                const auto &v = df_.get_column<double>(name.c_str());
+                std::vector<double> nv(n);
+                for (size_t j = 0; j < n; ++j) { int64_t r = indices[j]; size_t p = r >= 0 ? (size_t)r : (size_t)((int64_t)src_n + r); nv[j] = v[p]; }
+                out.df_.load_column<double>(name.c_str(), std::move(nv));
+            }
+            else if (type == "int64")
+            {
+                const auto &v = df_.get_column<int64_t>(name.c_str());
+                std::vector<int64_t> nv(n);
+                for (size_t j = 0; j < n; ++j) { int64_t r = indices[j]; size_t p = r >= 0 ? (size_t)r : (size_t)((int64_t)src_n + r); nv[j] = v[p]; }
+                out.df_.load_column<int64_t>(name.c_str(), std::move(nv));
+            }
+            else if (type == "bool")
+            {
+                const auto &v = df_.get_column<bool>(name.c_str());
+                std::vector<bool> nv(n);
+                for (size_t j = 0; j < n; ++j) { int64_t r = indices[j]; size_t p = r >= 0 ? (size_t)r : (size_t)((int64_t)src_n + r); nv[j] = v[p]; }
+                out.df_.load_column<bool>(name.c_str(), std::move(nv));
+            }
+            else
+            {
+                const auto &v = df_.get_column<std::string>(name.c_str());
+                std::vector<std::string> nv(n);
+                for (size_t j = 0; j < n; ++j) { int64_t r = indices[j]; size_t p = r >= 0 ? (size_t)r : (size_t)((int64_t)src_n + r); nv[j] = v[p]; }
+                out.df_.load_column<std::string>(name.c_str(), std::move(nv));
+            }
+        }
+        return out;
+    }
+
+    // ── new bulk operations ──────────────────────────────────────────────────
+
+    // 1. isna_frame — boolean GrizzlarFrame, True where value is NaN/empty
+    GrizzlarFrame isna_frame() const
+    {
+        GrizzlarFrame out;
+        const auto &src_idx = df_.get_index();
+        std::vector<ulong> new_idx(src_idx.begin(), src_idx.end());
+        out.df_.load_index(std::move(new_idx));
+        for (const auto &name : col_order_)
+        {
+            out.col_order_.push_back(name);
+            out.col_types_[name] = "bool";
+            const std::string &type = col_types_.at(name);
+            size_t n = df_.get_index().size();
+            std::vector<bool> bv(n, false);
+            if (type == "double")
+            {
+                const auto &v = df_.get_column<double>(name.c_str());
+                for (size_t i = 0; i < v.size(); ++i)
+                    bv[i] = std::isnan(v[i]);
+            }
+            else if (type == "string")
+            {
+                const auto &v = df_.get_column<std::string>(name.c_str());
+                for (size_t i = 0; i < v.size(); ++i)
+                    bv[i] = v[i].empty();
+            }
+            // int64/bool: always false
+            out.df_.load_column<bool>(name.c_str(), std::move(bv));
+        }
+        return out;
+    }
+
+    // 2. notna_frame — logical inverse of isna_frame
+    GrizzlarFrame notna_frame() const
+    {
+        GrizzlarFrame out;
+        const auto &src_idx = df_.get_index();
+        std::vector<ulong> new_idx(src_idx.begin(), src_idx.end());
+        out.df_.load_index(std::move(new_idx));
+        for (const auto &name : col_order_)
+        {
+            out.col_order_.push_back(name);
+            out.col_types_[name] = "bool";
+            const std::string &type = col_types_.at(name);
+            size_t n = df_.get_index().size();
+            std::vector<bool> bv(n, true);
+            if (type == "double")
+            {
+                const auto &v = df_.get_column<double>(name.c_str());
+                for (size_t i = 0; i < v.size(); ++i)
+                    bv[i] = !std::isnan(v[i]);
+            }
+            else if (type == "string")
+            {
+                const auto &v = df_.get_column<std::string>(name.c_str());
+                for (size_t i = 0; i < v.size(); ++i)
+                    bv[i] = !v[i].empty();
+            }
+            // int64/bool: always true
+            out.df_.load_column<bool>(name.c_str(), std::move(bv));
+        }
+        return out;
+    }
+
+    // 3. ffill_col — forward-fill NaN/empty in-place
+    void ffill_col(const std::string &col)
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        if (it->second == "double")
+        {
+            auto &v = df_.get_column<double>(col.c_str());
+            double last = std::numeric_limits<double>::quiet_NaN();
+            for (auto &x : v)
+            {
+                if (!std::isnan(x))
+                    last = x;
+                else if (!std::isnan(last))
+                    x = last;
+            }
+        }
+        else if (it->second == "string")
+        {
+            auto &v = df_.get_column<std::string>(col.c_str());
+            std::string last;
+            for (auto &x : v)
+            {
+                if (!x.empty())
+                    last = x;
+                else if (!last.empty())
+                    x = last;
+            }
+        }
+    }
+
+    // 4. bfill_col — backward-fill NaN/empty in-place
+    void bfill_col(const std::string &col)
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        if (it->second == "double")
+        {
+            auto &v = df_.get_column<double>(col.c_str());
+            double nxt = std::numeric_limits<double>::quiet_NaN();
+            for (int64_t i = static_cast<int64_t>(v.size()) - 1; i >= 0; --i)
+            {
+                if (!std::isnan(v[i]))
+                    nxt = v[i];
+                else if (!std::isnan(nxt))
+                    v[i] = nxt;
+            }
+        }
+        else if (it->second == "string")
+        {
+            auto &v = df_.get_column<std::string>(col.c_str());
+            std::string nxt;
+            for (int64_t i = static_cast<int64_t>(v.size()) - 1; i >= 0; --i)
+            {
+                if (!v[i].empty())
+                    nxt = v[i];
+                else if (!nxt.empty())
+                    v[i] = nxt;
+            }
+        }
+    }
+
+    // 5. clip_col — clip double/int64 values to [lower, upper] in-place
+    void clip_col(const std::string &col, double lower, double upper)
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        if (it->second == "double")
+        {
+            auto &v = df_.get_column<double>(col.c_str());
+            for (auto &x : v)
+                if (!std::isnan(x))
+                    x = std::max(lower, std::min(upper, x));
+        }
+        else if (it->second == "int64")
+        {
+            auto &v = df_.get_column<int64_t>(col.c_str());
+            for (auto &x : v)
+                x = static_cast<int64_t>(std::max(lower, std::min(upper, static_cast<double>(x))));
+        }
+    }
+
+    // 6. round_col — round double column to decimals places in-place
+    void round_col(const std::string &col, int decimals)
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        if (it->second == "double")
+        {
+            double factor = std::pow(10.0, decimals);
+            auto &v = df_.get_column<double>(col.c_str());
+            for (auto &x : v)
+                if (!std::isnan(x))
+                    x = std::round(x * factor) / factor;
+        }
+    }
+
+    // 7. abs_col — absolute value of double/int64 column in-place
+    void abs_col(const std::string &col)
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        if (it->second == "double")
+        {
+            auto &v = df_.get_column<double>(col.c_str());
+            for (auto &x : v)
+                x = std::abs(x);
+        }
+        else if (it->second == "int64")
+        {
+            auto &v = df_.get_column<int64_t>(col.c_str());
+            for (auto &x : v)
+                x = std::abs(x);
+        }
+    }
+
+    // 8. diff_col — discrete difference
+    std::vector<double> diff_col(const std::string &col, int periods) const
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        std::vector<double> result;
+        if (it->second == "double")
+        {
+            const auto &v = df_.get_column<double>(col.c_str());
+            result.resize(v.size(), nan);
+            for (size_t i = static_cast<size_t>(periods); i < v.size(); ++i)
+                result[i] = v[i] - v[i - static_cast<size_t>(periods)];
+        }
+        else if (it->second == "int64")
+        {
+            const auto &v = df_.get_column<int64_t>(col.c_str());
+            result.resize(v.size(), nan);
+            for (size_t i = static_cast<size_t>(periods); i < v.size(); ++i)
+                result[i] = static_cast<double>(v[i]) - static_cast<double>(v[i - static_cast<size_t>(periods)]);
+        }
+        return result;
+    }
+
+    // 9. isin_col — boolean membership test
+    std::vector<bool> isin_col(const std::string &col, py::object values) const
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        const std::string &type = it->second;
+        std::vector<bool> result;
+
+        if (type == "double")
+        {
+            std::unordered_set<double> val_set;
+            for (auto item : py::cast<py::iterable>(values))
+                val_set.insert(py::cast<double>(item));
+            const auto &v = df_.get_column<double>(col.c_str());
+            result.reserve(v.size());
+            for (const auto &x : v)
+                result.push_back(val_set.count(x) > 0);
+        }
+        else if (type == "int64")
+        {
+            std::unordered_set<int64_t> val_set;
+            for (auto item : py::cast<py::iterable>(values))
+                val_set.insert(py::cast<int64_t>(item));
+            const auto &v = df_.get_column<int64_t>(col.c_str());
+            result.reserve(v.size());
+            for (const auto &x : v)
+                result.push_back(val_set.count(x) > 0);
+        }
+        else if (type == "string")
+        {
+            std::unordered_set<std::string> val_set;
+            for (auto item : py::cast<py::iterable>(values))
+                val_set.insert(py::cast<std::string>(item));
+            const auto &v = df_.get_column<std::string>(col.c_str());
+            result.reserve(v.size());
+            for (const auto &x : v)
+                result.push_back(val_set.count(x) > 0);
+        }
+        else
+        {
+            std::unordered_set<int> val_set;
+            for (auto item : py::cast<py::iterable>(values))
+                val_set.insert(py::cast<bool>(item) ? 1 : 0);
+            const auto &v = df_.get_column<bool>(col.c_str());
+            result.reserve(v.size());
+            for (bool x : v)
+                result.push_back(val_set.count(x ? 1 : 0) > 0);
+        }
+        return result;
+    }
+
+    // 10. replace_col — replace values in one column via dict mapping
+    void replace_col(const std::string &col, py::dict mapping)
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        const std::string &type = it->second;
+        if (type == "double")
+        {
+            std::unordered_map<double, double> m;
+            for (auto item : mapping)
+                m[py::cast<double>(item.first)] = py::cast<double>(item.second);
+            auto &v = df_.get_column<double>(col.c_str());
+            for (auto &x : v)
+            {
+                auto mi = m.find(x);
+                if (mi != m.end())
+                    x = mi->second;
+            }
+        }
+        else if (type == "int64")
+        {
+            std::unordered_map<int64_t, int64_t> m;
+            for (auto item : mapping)
+                m[py::cast<int64_t>(item.first)] = py::cast<int64_t>(item.second);
+            auto &v = df_.get_column<int64_t>(col.c_str());
+            for (auto &x : v)
+            {
+                auto mi = m.find(x);
+                if (mi != m.end())
+                    x = mi->second;
+            }
+        }
+        else if (type == "string")
+        {
+            std::unordered_map<std::string, std::string> m;
+            for (auto item : mapping)
+                m[py::cast<std::string>(item.first)] = py::cast<std::string>(item.second);
+            auto &v = df_.get_column<std::string>(col.c_str());
+            for (auto &x : v)
+            {
+                auto mi = m.find(x);
+                if (mi != m.end())
+                    x = mi->second;
+            }
+        }
+    }
+
+    // 11. replace_all_cols — replace_col applied to all columns
+    void replace_all_cols(py::dict mapping)
+    {
+        for (const auto &name : col_order_)
+        {
+            try { replace_col(name, mapping); }
+            catch (...) {}
+        }
+    }
+
+    // 12. reduce_all — apply reduction function to all numeric columns, return 1-row frame
+    GrizzlarFrame reduce_all(const std::string &func) const
+    {
+        GrizzlarFrame out;
+        std::vector<ulong> idx = {0};
+        out.df_.load_index(std::move(idx));
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        for (const auto &name : col_order_)
+        {
+            const std::string &type = col_types_.at(name);
+            if (type != "double" && type != "int64" && type != "bool")
+                continue;
+            out.col_order_.push_back(name);
+            out.col_types_[name] = "double";
+            double val = nan;
+            if (type == "bool")
+            {
+                const auto &bv = df_.get_column<bool>(name.c_str());
+                size_t n = bv.size();
+                if (n == 0) { out.df_.load_column<double>(name.c_str(), {val}); continue; }
+                size_t trues = 0;
+                for (bool b : bv) trues += b ? 1 : 0;
+                if (func == "sum" || func == "count") val = static_cast<double>(trues);
+                else if (func == "mean") val = static_cast<double>(trues) / n;
+                else if (func == "min") val = trues > 0 ? 0.0 : 0.0; // at least one false
+                else if (func == "max") val = trues == n ? 1.0 : (trues > 0 ? 1.0 : 0.0);
+                else if (func == "std")
+                {
+                    double m = static_cast<double>(trues) / n;
+                    double sq = 0;
+                    for (bool b : bv) { double d = (b ? 1.0 : 0.0) - m; sq += d * d; }
+                    val = n > 1 ? std::sqrt(sq / (n - 1)) : 0.0;
+                }
+                else if (func == "median")
+                {
+                    // sorted bool: 0..0..1..1 — median is just the middle value
+                    std::vector<double> sorted_v(n);
+                    for (size_t i = 0; i < n; ++i) sorted_v[i] = bv[i] ? 1.0 : 0.0;
+                    std::sort(sorted_v.begin(), sorted_v.end());
+                    double pos = 0.5 * (n - 1);
+                    size_t lo = static_cast<size_t>(pos);
+                    val = sorted_v[lo] + (pos - lo) * (lo + 1 < n ? sorted_v[lo+1] - sorted_v[lo] : 0.0);
+                }
+                else if (func == "var")
+                {
+                    double m = static_cast<double>(trues) / n;
+                    double sq = 0;
+                    for (bool b : bv) { double d = (b ? 1.0 : 0.0) - m; sq += d * d; }
+                    val = n > 1 ? sq / (n - 1) : 0.0;
+                }
+            }
+            else
+            {
+                // Use existing scalar methods (which handle double and int64)
+                // We need a non-const self here; cast away const for these read-only visitors
+                GrizzlarFrame *self = const_cast<GrizzlarFrame *>(this);
+                if (func == "sum") val = self->sum(name);
+                else if (func == "mean") val = self->mean(name);
+                else if (func == "std") val = self->std_dev(name);
+                else if (func == "min") val = self->col_min(name);
+                else if (func == "max") val = self->col_max(name);
+                else if (func == "count") val = static_cast<double>(self->count(name));
+                else if (func == "median")
+                {
+                    std::vector<double> vals;
+                    if (type == "double")
+                    {
+                        const auto &v = df_.get_column<double>(name.c_str());
+                        for (double x : v) if (!std::isnan(x)) vals.push_back(x);
+                    }
+                    else
+                    {
+                        const auto &v = df_.get_column<int64_t>(name.c_str());
+                        for (int64_t x : v) vals.push_back(static_cast<double>(x));
+                    }
+                    if (!vals.empty())
+                    {
+                        std::sort(vals.begin(), vals.end());
+                        double pos = 0.5 * (vals.size() - 1);
+                        size_t lo = static_cast<size_t>(pos);
+                        val = vals[lo] + (pos - lo) * (lo + 1 < vals.size() ? vals[lo+1] - vals[lo] : 0.0);
+                    }
+                }
+                else if (func == "var")
+                {
+                    double m = self->mean(name);
+                    std::vector<double> vals;
+                    if (type == "double")
+                    {
+                        const auto &v = df_.get_column<double>(name.c_str());
+                        for (double x : v) if (!std::isnan(x)) vals.push_back(x);
+                    }
+                    else
+                    {
+                        const auto &v = df_.get_column<int64_t>(name.c_str());
+                        for (int64_t x : v) vals.push_back(static_cast<double>(x));
+                    }
+                    size_t n = vals.size();
+                    if (n > 1)
+                    {
+                        double sq = 0;
+                        for (double x : vals) { double d = x - m; sq += d * d; }
+                        val = sq / (n - 1);
+                    }
+                    else val = 0.0;
+                }
+            }
+            out.df_.load_column<double>(name.c_str(), {val});
+        }
+        return out;
+    }
+
+    // 13. arith_scalar — arithmetic op with a scalar, returns new frame
+    GrizzlarFrame arith_scalar(const std::string &op, double scalar) const
+    {
+        GrizzlarFrame out = deep_copy();
+        for (const auto &name : col_order_)
+        {
+            const std::string &type = col_types_.at(name);
+            if (type == "double")
+            {
+                const auto &src = df_.get_column<double>(name.c_str());
+                std::vector<double> nv(src.size());
+                for (size_t i = 0; i < src.size(); ++i)
+                {
+                    if (op == "+")       nv[i] = src[i] + scalar;
+                    else if (op == "-")  nv[i] = src[i] - scalar;
+                    else if (op == "*")  nv[i] = src[i] * scalar;
+                    else if (op == "/")  nv[i] = src[i] / scalar;
+                    else if (op == "//") nv[i] = std::floor(src[i] / scalar);
+                    else if (op == "%")  nv[i] = std::fmod(src[i], scalar);
+                    else if (op == "**") nv[i] = std::pow(src[i], scalar);
+                    else nv[i] = src[i];
+                }
+                out.df_.load_column<double>(name.c_str(), std::move(nv));
+            }
+            else if (type == "int64")
+            {
+                const auto &src = df_.get_column<int64_t>(name.c_str());
+                std::vector<double> nv(src.size());
+                for (size_t i = 0; i < src.size(); ++i)
+                {
+                    double s = static_cast<double>(src[i]);
+                    if (op == "+")       nv[i] = s + scalar;
+                    else if (op == "-")  nv[i] = s - scalar;
+                    else if (op == "*")  nv[i] = s * scalar;
+                    else if (op == "/")  nv[i] = s / scalar;
+                    else if (op == "//") nv[i] = std::floor(s / scalar);
+                    else if (op == "%")  nv[i] = std::fmod(s, scalar);
+                    else if (op == "**") nv[i] = std::pow(s, scalar);
+                    else nv[i] = s;
+                }
+                out.col_types_[name] = "double";
+                out.df_.remove_column<int64_t>(name.c_str());
+                out.df_.load_column<double>(name.c_str(), std::move(nv));
+            }
+        }
+        return out;
+    }
+
+    // 14. arith_frame_op — element-wise arithmetic between matching numeric columns
+    GrizzlarFrame arith_frame_op(const std::string &op, const GrizzlarFrame &other) const
+    {
+        GrizzlarFrame out = deep_copy();
+        for (const auto &name : col_order_)
+        {
+            const std::string &type = col_types_.at(name);
+            if (type != "double" && type != "int64")
+                continue;
+            auto ot = other.col_types_.find(name);
+            if (ot == other.col_types_.end())
+                continue;
+            if (ot->second != "double" && ot->second != "int64")
+                continue;
+
+            auto to_dbl = [](const GrizzlarFrame &f, const std::string &c, const std::string &t) -> std::vector<double>
+            {
+                if (t == "double")
+                {
+                    const auto &v = f.df_.get_column<double>(c.c_str());
+                    return {v.begin(), v.end()};
+                }
+                const auto &v = f.df_.get_column<int64_t>(c.c_str());
+                std::vector<double> r; r.reserve(v.size());
+                for (auto x : v) r.push_back(static_cast<double>(x));
+                return r;
+            };
+
+            auto a = to_dbl(*this, name, type);
+            auto b = to_dbl(other, name, ot->second);
+            size_t n = std::min(a.size(), b.size());
+            std::vector<double> nv(a.size(), std::numeric_limits<double>::quiet_NaN());
+            for (size_t i = 0; i < n; ++i)
+            {
+                if (op == "+")       nv[i] = a[i] + b[i];
+                else if (op == "-")  nv[i] = a[i] - b[i];
+                else if (op == "*")  nv[i] = a[i] * b[i];
+                else if (op == "/")  nv[i] = a[i] / b[i];
+                else if (op == "//") nv[i] = std::floor(a[i] / b[i]);
+                else if (op == "%")  nv[i] = std::fmod(a[i], b[i]);
+                else if (op == "**") nv[i] = std::pow(a[i], b[i]);
+                else nv[i] = a[i];
+            }
+            if (type == "double")
+                out.df_.load_column<double>(name.c_str(), std::move(nv));
+            else
+            {
+                out.col_types_[name] = "double";
+                out.df_.remove_column<int64_t>(name.c_str());
+                out.df_.load_column<double>(name.c_str(), std::move(nv));
+            }
+        }
+        return out;
+    }
+
+    // 15. compare_scalar — compare each numeric column value to scalar, returns bool frame
+    GrizzlarFrame compare_scalar(const std::string &op, double scalar) const
+    {
+        GrizzlarFrame out;
+        const auto &src_idx = df_.get_index();
+        std::vector<ulong> new_idx(src_idx.begin(), src_idx.end());
+        out.df_.load_index(std::move(new_idx));
+        for (const auto &name : col_order_)
+        {
+            out.col_order_.push_back(name);
+            const std::string &type = col_types_.at(name);
+            size_t n = df_.get_index().size();
+            std::vector<bool> bv(n, false);
+
+            auto cmp = [&](double x) -> bool {
+                if (op == "==")       return x == scalar;
+                else if (op == "!=")  return x != scalar;
+                else if (op == ">")   return x > scalar;
+                else if (op == ">=")  return x >= scalar;
+                else if (op == "<")   return x < scalar;
+                else if (op == "<=")  return x <= scalar;
+                return false;
+            };
+
+            if (type == "double")
+            {
+                const auto &v = df_.get_column<double>(name.c_str());
+                for (size_t i = 0; i < v.size(); ++i)
+                    bv[i] = cmp(v[i]);
+            }
+            else if (type == "int64")
+            {
+                const auto &v = df_.get_column<int64_t>(name.c_str());
+                for (size_t i = 0; i < v.size(); ++i)
+                    bv[i] = cmp(static_cast<double>(v[i]));
+            }
+            out.col_types_[name] = "bool";
+            out.df_.load_column<bool>(name.c_str(), std::move(bv));
+        }
+        return out;
+    }
+
+    // 16. skew_col — sample skewness
+    double skew_col(const std::string &col) const
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        std::vector<double> vals;
+        if (it->second == "double")
+        {
+            const auto &v = df_.get_column<double>(col.c_str());
+            for (double x : v) if (!std::isnan(x)) vals.push_back(x);
+        }
+        else if (it->second == "int64")
+        {
+            const auto &v = df_.get_column<int64_t>(col.c_str());
+            for (int64_t x : v) vals.push_back(static_cast<double>(x));
+        }
+        else return std::numeric_limits<double>::quiet_NaN();
+
+        const size_t n = vals.size();
+        if (n < 3) return std::numeric_limits<double>::quiet_NaN();
+        double mu = std::accumulate(vals.begin(), vals.end(), 0.0) / n;
+        double sq = 0, cu = 0;
+        for (double x : vals) { double d = x - mu; sq += d * d; cu += d * d * d; }
+        double s = std::sqrt(sq / (n - 1));
+        if (s == 0) return std::numeric_limits<double>::quiet_NaN();
+        return (static_cast<double>(n) / ((n-1.0) * (n-2.0))) * (cu / (s * s * s));
+    }
+
+    // 17. kurt_col — excess kurtosis
+    double kurt_col(const std::string &col) const
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        std::vector<double> vals;
+        if (it->second == "double")
+        {
+            const auto &v = df_.get_column<double>(col.c_str());
+            for (double x : v) if (!std::isnan(x)) vals.push_back(x);
+        }
+        else if (it->second == "int64")
+        {
+            const auto &v = df_.get_column<int64_t>(col.c_str());
+            for (int64_t x : v) vals.push_back(static_cast<double>(x));
+        }
+        else return std::numeric_limits<double>::quiet_NaN();
+
+        const size_t n = vals.size();
+        if (n < 4) return std::numeric_limits<double>::quiet_NaN();
+        double mu = std::accumulate(vals.begin(), vals.end(), 0.0) / n;
+        double sq = 0, qu = 0;
+        for (double x : vals) { double d = x - mu; sq += d * d; qu += d * d * d * d; }
+        double s = std::sqrt(sq / (n - 1));
+        if (s == 0) return std::numeric_limits<double>::quiet_NaN();
+        double k4 = (static_cast<double>(n) * (n + 1.0)) / ((n-1.0) * (n-2.0) * (n-3.0)) * (qu / (s * s * s * s));
+        double corr = 3.0 * (n - 1.0) * (n - 1.0) / ((n - 2.0) * (n - 3.0));
+        return k4 - corr;
+    }
+
+    // 18. mode_col — most frequent value(s), skipping NaN/""
+    py::list mode_col(const std::string &col) const
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        const std::string &type = it->second;
+        py::list result;
+
+        auto compute_mode_str = [&](auto &vec)
+        {
+            std::map<std::string, int64_t> cnt;
+            for (const auto &x : vec)
+            {
+                std::string key;
+                if constexpr (std::is_same_v<std::decay_t<decltype(x)>, std::string>)
+                {
+                    if (x.empty()) continue;
+                    key = x;
+                }
+                else
+                {
+                    key = std::to_string(x);
+                }
+                cnt[key]++;
+            }
+            if (cnt.empty()) return;
+            int64_t max_cnt = std::max_element(cnt.begin(), cnt.end(),
+                [](const auto &a, const auto &b){ return a.second < b.second; })->second;
+            for (const auto &[k, c] : cnt)
+                if (c == max_cnt) result.append(py::str(k));
+        };
+
+        if (type == "double")
+        {
+            const auto &v = df_.get_column<double>(col.c_str());
+            std::map<double, int64_t> cnt;
+            for (double x : v) { if (!std::isnan(x)) cnt[x]++; }
+            if (!cnt.empty())
+            {
+                int64_t mc = std::max_element(cnt.begin(), cnt.end(),
+                    [](const auto &a, const auto &b){ return a.second < b.second; })->second;
+                for (const auto &[k, c] : cnt)
+                    if (c == mc) result.append(py::float_(k));
+            }
+        }
+        else if (type == "int64")
+        {
+            const auto &v = df_.get_column<int64_t>(col.c_str());
+            std::map<int64_t, int64_t> cnt;
+            for (int64_t x : v) cnt[x]++;
+            if (!cnt.empty())
+            {
+                int64_t mc = std::max_element(cnt.begin(), cnt.end(),
+                    [](const auto &a, const auto &b){ return a.second < b.second; })->second;
+                for (const auto &[k, c] : cnt)
+                    if (c == mc) result.append(py::int_(k));
+            }
+        }
+        else if (type == "string")
+        {
+            const auto &v = df_.get_column<std::string>(col.c_str());
+            compute_mode_str(v);
+        }
+        return result;
+    }
+
+    // 19. duplicated_rows — mark duplicate rows
+    std::vector<bool> duplicated_rows(const std::vector<std::string> &cols, const std::string &keep) const
+    {
+        size_t n = df_.get_index().size();
+        std::vector<bool> result(n, false);
+
+        // Build per-row string keys
+        auto row_key = [&](size_t i) -> std::string
+        {
+            std::string k;
+            for (const auto &c : cols)
+            {
+                auto it = col_types_.find(c);
+                if (it == col_types_.end()) continue;
+                const std::string &type = it->second;
+                if (type == "double")
+                {
+                    const auto &v = df_.get_column<double>(c.c_str());
+                    k += std::to_string(v[i]) + "|";
+                }
+                else if (type == "int64")
+                {
+                    const auto &v = df_.get_column<int64_t>(c.c_str());
+                    k += std::to_string(v[i]) + "|";
+                }
+                else if (type == "string")
+                {
+                    const auto &v = df_.get_column<std::string>(c.c_str());
+                    k += v[i] + "|";
+                }
+                else
+                {
+                    const auto &v = df_.get_column<bool>(c.c_str());
+                    k += (v[i] ? "1" : "0") + std::string("|");
+                }
+            }
+            return k;
+        };
+
+        if (keep == "last")
+        {
+            std::unordered_map<std::string, size_t> seen; // key -> last seen position
+            for (size_t i = 0; i < n; ++i)
+            {
+                std::string k = row_key(i);
+                auto it = seen.find(k);
+                if (it != seen.end())
+                {
+                    result[it->second] = true;  // mark previous as duplicate
+                    it->second = i;             // update to current
+                }
+                else
+                    seen[k] = i;
+            }
+        }
+        else if (keep == "false")
+        {
+            std::unordered_map<std::string, std::vector<size_t>> positions;
+            for (size_t i = 0; i < n; ++i)
+                positions[row_key(i)].push_back(i);
+            for (const auto &[k, pos] : positions)
+                if (pos.size() > 1)
+                    for (size_t p : pos) result[p] = true;
+        }
+        else // "first" (default)
+        {
+            std::unordered_set<std::string> seen;
+            for (size_t i = 0; i < n; ++i)
+            {
+                std::string k = row_key(i);
+                if (!seen.insert(k).second)
+                    result[i] = true;
+            }
+        }
+        return result;
+    }
+
+    // 20. melt_frame — unpivot wide to long
+    GrizzlarFrame melt_frame(const std::vector<std::string> &id_cols,
+                              const std::vector<std::string> &val_cols,
+                              const std::string &var_name,
+                              const std::string &value_name) const
+    {
+        size_t n = df_.get_index().size();
+        size_t out_n = n * val_cols.size();
+
+        GrizzlarFrame out;
+        std::vector<ulong> new_idx(out_n);
+        std::iota(new_idx.begin(), new_idx.end(), 0);
+        out.df_.load_index(std::move(new_idx));
+
+        // id columns
+        for (const auto &ic : id_cols)
+        {
+            out.col_order_.push_back(ic);
+            const std::string &type = col_types_.at(ic);
+            out.col_types_[ic] = type;
+            if (type == "double")
+            {
+                const auto &src = df_.get_column<double>(ic.c_str());
+                std::vector<double> nv; nv.reserve(out_n);
+                for (size_t vc_i = 0; vc_i < val_cols.size(); ++vc_i)
+                    for (size_t r = 0; r < n; ++r) nv.push_back(src[r]);
+                out.df_.load_column<double>(ic.c_str(), std::move(nv));
+            }
+            else if (type == "int64")
+            {
+                const auto &src = df_.get_column<int64_t>(ic.c_str());
+                std::vector<int64_t> nv; nv.reserve(out_n);
+                for (size_t vc_i = 0; vc_i < val_cols.size(); ++vc_i)
+                    for (size_t r = 0; r < n; ++r) nv.push_back(src[r]);
+                out.df_.load_column<int64_t>(ic.c_str(), std::move(nv));
+            }
+            else if (type == "bool")
+            {
+                const auto &src = df_.get_column<bool>(ic.c_str());
+                std::vector<bool> nv; nv.reserve(out_n);
+                for (size_t vc_i = 0; vc_i < val_cols.size(); ++vc_i)
+                    for (size_t r = 0; r < n; ++r) nv.push_back(src[r]);
+                out.df_.load_column<bool>(ic.c_str(), std::move(nv));
+            }
+            else
+            {
+                const auto &src = df_.get_column<std::string>(ic.c_str());
+                std::vector<std::string> nv; nv.reserve(out_n);
+                for (size_t vc_i = 0; vc_i < val_cols.size(); ++vc_i)
+                    for (size_t r = 0; r < n; ++r) nv.push_back(src[r]);
+                out.df_.load_column<std::string>(ic.c_str(), std::move(nv));
+            }
+        }
+
+        // variable column
+        out.col_order_.push_back(var_name);
+        out.col_types_[var_name] = "string";
+        std::vector<std::string> var_col; var_col.reserve(out_n);
+        for (const auto &vc : val_cols)
+            for (size_t r = 0; r < n; ++r) var_col.push_back(vc);
+        out.df_.load_column<std::string>(var_name.c_str(), std::move(var_col));
+
+        // value column — use double as common type
+        out.col_order_.push_back(value_name);
+        out.col_types_[value_name] = "double";
+        std::vector<double> val_col_data; val_col_data.reserve(out_n);
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        for (const auto &vc : val_cols)
+        {
+            auto vt = col_types_.find(vc);
+            const std::string &vtype = vt != col_types_.end() ? vt->second : "double";
+            if (vtype == "double")
+            {
+                const auto &src = df_.get_column<double>(vc.c_str());
+                for (size_t r = 0; r < n; ++r) val_col_data.push_back(src[r]);
+            }
+            else if (vtype == "int64")
+            {
+                const auto &src = df_.get_column<int64_t>(vc.c_str());
+                for (size_t r = 0; r < n; ++r) val_col_data.push_back(static_cast<double>(src[r]));
+            }
+            else if (vtype == "bool")
+            {
+                const auto &src = df_.get_column<bool>(vc.c_str());
+                for (size_t r = 0; r < n; ++r) val_col_data.push_back(src[r] ? 1.0 : 0.0);
+            }
+            else
+            {
+                for (size_t r = 0; r < n; ++r) val_col_data.push_back(nan);
+            }
+        }
+        out.df_.load_column<double>(value_name.c_str(), std::move(val_col_data));
+        return out;
+    }
+
+    // 21. transpose_frame — rows become columns, columns become rows
+    GrizzlarFrame transpose_frame() const
+    {
+        const size_t n = df_.get_index().size();
+        const size_t ncols = col_order_.size();
+        GrizzlarFrame out;
+        std::vector<ulong> new_idx(ncols);
+        std::iota(new_idx.begin(), new_idx.end(), 0);
+        out.df_.load_index(std::move(new_idx));
+
+        // New column names: old index values as strings (col named "0","1","2",...)
+        const auto &src_idx = df_.get_index();
+        for (size_t i = 0; i < n; ++i)
+        {
+            std::string cname = std::to_string(src_idx[i]);
+            out.col_order_.push_back(cname);
+            out.col_types_[cname] = "double";
+            std::vector<double> col_data(ncols, std::numeric_limits<double>::quiet_NaN());
+            for (size_t j = 0; j < ncols; ++j)
+            {
+                const std::string &type = col_types_.at(col_order_[j]);
+                if (type == "double")
+                {
+                    const auto &v = df_.get_column<double>(col_order_[j].c_str());
+                    if (i < v.size()) col_data[j] = v[i];
+                }
+                else if (type == "int64")
+                {
+                    const auto &v = df_.get_column<int64_t>(col_order_[j].c_str());
+                    if (i < v.size()) col_data[j] = static_cast<double>(v[i]);
+                }
+                else if (type == "bool")
+                {
+                    const auto &v = df_.get_column<bool>(col_order_[j].c_str());
+                    if (i < v.size()) col_data[j] = v[i] ? 1.0 : 0.0;
+                }
+                // string: leave as NaN
+            }
+            out.df_.load_column<double>(cname.c_str(), std::move(col_data));
+        }
+        return out;
+    }
+
+    // 22. set_index_col — use column values as index
+    GrizzlarFrame set_index_col(const std::string &col, bool drop) const
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        const std::string &type = it->second;
+        size_t n = df_.get_index().size();
+        std::vector<ulong> new_idx(n);
+        if (type == "int64")
+        {
+            const auto &v = df_.get_column<int64_t>(col.c_str());
+            for (size_t i = 0; i < n; ++i)
+                new_idx[i] = static_cast<ulong>(v[i]);
+        }
+        else if (type == "double")
+        {
+            const auto &v = df_.get_column<double>(col.c_str());
+            for (size_t i = 0; i < n; ++i)
+                new_idx[i] = static_cast<ulong>(v[i]);
+        }
+        else
+        {
+            for (size_t i = 0; i < n; ++i) new_idx[i] = static_cast<ulong>(i);
+        }
+
+        GrizzlarFrame out = deep_copy();
+        out.df_.load_index(std::move(new_idx));
+        if (drop)
+            out.drop_column(col);
+        return out;
+    }
+
+    // 23. reset_index_frame — reset index to 0..N-1
+    GrizzlarFrame reset_index_frame(bool drop) const
+    {
+        GrizzlarFrame out = deep_copy();
+        size_t n = df_.get_index().size();
+        if (!drop)
+        {
+            const auto &old_idx = df_.get_index();
+            std::vector<int64_t> idx_vals(n);
+            for (size_t i = 0; i < n; ++i)
+                idx_vals[i] = static_cast<int64_t>(old_idx[i]);
+            // Insert at front: rebuild with "index" col first
+            GrizzlarFrame rebuilt;
+            std::vector<ulong> new_idx(n);
+            std::iota(new_idx.begin(), new_idx.end(), 0);
+            rebuilt.df_.load_index(std::move(new_idx));
+            rebuilt.col_order_.push_back("index");
+            rebuilt.col_types_["index"] = "int64";
+            rebuilt.df_.load_column<int64_t>("index", std::move(idx_vals));
+            for (const auto &nm : col_order_)
+            {
+                rebuilt.col_order_.push_back(nm);
+                rebuilt.col_types_[nm] = col_types_.at(nm);
+                const std::string &type = col_types_.at(nm);
+                if (type == "double")
+                    rebuilt.df_.load_column<double>(nm.c_str(), df_.get_column<double>(nm.c_str()));
+                else if (type == "int64")
+                    rebuilt.df_.load_column<int64_t>(nm.c_str(), df_.get_column<int64_t>(nm.c_str()));
+                else if (type == "bool")
+                    rebuilt.df_.load_column<bool>(nm.c_str(), df_.get_column<bool>(nm.c_str()));
+                else
+                    rebuilt.df_.load_column<std::string>(nm.c_str(), df_.get_column<std::string>(nm.c_str()));
+            }
+            return rebuilt;
+        }
+        std::vector<ulong> new_idx(n);
+        std::iota(new_idx.begin(), new_idx.end(), 0);
+        out.df_.load_index(std::move(new_idx));
+        return out;
+    }
+
+    // 24. astype_col — cast a column to target type in-place
+    void astype_col(const std::string &col, const std::string &target_type)
+    {
+        auto it = col_types_.find(col);
+        if (it == col_types_.end())
+            throw std::runtime_error("Column not found: " + col);
+        const std::string &src_type = it->second;
+        if (src_type == target_type) return;
+
+        size_t n = df_.get_index().size();
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+
+        if (target_type == "double")
+        {
+            std::vector<double> nv(n, nan);
+            if (src_type == "int64") { const auto &v = df_.get_column<int64_t>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=static_cast<double>(v[i]); }
+            else if (src_type == "bool") { const auto &v = df_.get_column<bool>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=v[i]?1.0:0.0; }
+            else if (src_type == "string") { const auto &v = df_.get_column<std::string>(col.c_str()); char *e; for (size_t i=0;i<n;++i) { double d=std::strtod(v[i].c_str(),&e); nv[i]=(e!=v[i].c_str())?d:nan; } }
+            if (src_type == "int64") df_.remove_column<int64_t>(col.c_str());
+            else if (src_type == "bool") df_.remove_column<bool>(col.c_str());
+            else if (src_type == "string") df_.remove_column<std::string>(col.c_str());
+            df_.load_column<double>(col.c_str(), std::move(nv));
+            col_types_[col] = "double";
+        }
+        else if (target_type == "int64")
+        {
+            std::vector<int64_t> nv(n, 0);
+            if (src_type == "double") { const auto &v = df_.get_column<double>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=static_cast<int64_t>(v[i]); }
+            else if (src_type == "bool") { const auto &v = df_.get_column<bool>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=v[i]?1:0; }
+            else if (src_type == "string") { const auto &v = df_.get_column<std::string>(col.c_str()); char *e; for (size_t i=0;i<n;++i) { long long d=std::strtoll(v[i].c_str(),&e,10); nv[i]=(e!=v[i].c_str())?static_cast<int64_t>(d):0; } }
+            if (src_type == "double") df_.remove_column<double>(col.c_str());
+            else if (src_type == "bool") df_.remove_column<bool>(col.c_str());
+            else if (src_type == "string") df_.remove_column<std::string>(col.c_str());
+            df_.load_column<int64_t>(col.c_str(), std::move(nv));
+            col_types_[col] = "int64";
+        }
+        else if (target_type == "string")
+        {
+            std::vector<std::string> nv(n);
+            if (src_type == "double") { const auto &v = df_.get_column<double>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=std::isnan(v[i])?"":std::to_string(v[i]); }
+            else if (src_type == "int64") { const auto &v = df_.get_column<int64_t>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=std::to_string(v[i]); }
+            else if (src_type == "bool") { const auto &v = df_.get_column<bool>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=v[i]?"true":"false"; }
+            if (src_type == "double") df_.remove_column<double>(col.c_str());
+            else if (src_type == "int64") df_.remove_column<int64_t>(col.c_str());
+            else if (src_type == "bool") df_.remove_column<bool>(col.c_str());
+            df_.load_column<std::string>(col.c_str(), std::move(nv));
+            col_types_[col] = "string";
+        }
+        else if (target_type == "bool")
+        {
+            std::vector<bool> nv(n, false);
+            if (src_type == "double") { const auto &v = df_.get_column<double>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=(v[i]!=0.0&&!std::isnan(v[i])); }
+            else if (src_type == "int64") { const auto &v = df_.get_column<int64_t>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=(v[i]!=0); }
+            else if (src_type == "string") { const auto &v = df_.get_column<std::string>(col.c_str()); for (size_t i=0;i<n;++i) nv[i]=(!v[i].empty()&&v[i]!="false"&&v[i]!="0"); }
+            if (src_type == "double") df_.remove_column<double>(col.c_str());
+            else if (src_type == "int64") df_.remove_column<int64_t>(col.c_str());
+            else if (src_type == "string") df_.remove_column<std::string>(col.c_str());
+            df_.load_column<bool>(col.c_str(), std::move(nv));
+            col_types_[col] = "bool";
+        }
+    }
+
+    // 25. where_frame — replace values where cond_frame is false with fill_val
+    GrizzlarFrame where_frame(const GrizzlarFrame &cond_frame, double fill_val) const
+    {
+        GrizzlarFrame out = deep_copy();
+        for (const auto &name : col_order_)
+        {
+            auto ct = cond_frame.col_types_.find(name);
+            if (ct == cond_frame.col_types_.end()) continue;
+            if (ct->second != "bool") continue;
+            const auto &mask = cond_frame.df_.get_column<bool>(name.c_str());
+            const std::string &type = col_types_.at(name);
+            if (type == "double")
+            {
+                const auto &src = df_.get_column<double>(name.c_str());
+                std::vector<double> nv(src.size());
+                for (size_t i = 0; i < src.size(); ++i)
+                    nv[i] = (i < mask.size() && mask[i]) ? src[i] : fill_val;
+                out.df_.load_column<double>(name.c_str(), std::move(nv));
+            }
+            else if (type == "int64")
+            {
+                const auto &src = df_.get_column<int64_t>(name.c_str());
+                std::vector<double> nv(src.size());
+                for (size_t i = 0; i < src.size(); ++i)
+                    nv[i] = (i < mask.size() && mask[i]) ? static_cast<double>(src[i]) : fill_val;
+                out.col_types_[name] = "double";
+                out.df_.remove_column<int64_t>(name.c_str());
+                out.df_.load_column<double>(name.c_str(), std::move(nv));
+            }
+        }
+        return out;
+    }
+
+    // 26. corr_matrix — full Pearson correlation matrix
+    GrizzlarFrame corr_matrix() const
+    {
+        std::vector<std::string> num_cols;
+        for (const auto &name : col_order_)
+        {
+            const std::string &t = col_types_.at(name);
+            if (t == "double" || t == "int64") num_cols.push_back(name);
+        }
+        const size_t k = num_cols.size();
+        GrizzlarFrame out;
+        std::vector<ulong> new_idx(k);
+        std::iota(new_idx.begin(), new_idx.end(), 0);
+        out.df_.load_index(std::move(new_idx));
+
+        // Leading label column
+        out.col_order_.push_back("");
+        out.col_types_[""] = "string";
+        out.df_.load_column<std::string>("", std::vector<std::string>(num_cols.begin(), num_cols.end()));
+
+        for (size_t i = 0; i < k; ++i)
+        {
+            const std::string &ci = num_cols[i];
+            out.col_order_.push_back(ci);
+            out.col_types_[ci] = "double";
+            std::vector<double> col_vals(k);
+            for (size_t j = 0; j < k; ++j)
+            {
+                if (i == j) col_vals[j] = 1.0;
+                else col_vals[j] = corr(ci, num_cols[j]);
+            }
+            out.df_.load_column<double>(ci.c_str(), std::move(col_vals));
+        }
+        return out;
+    }
+
+    // 27. cov_matrix — full covariance matrix
+    GrizzlarFrame cov_matrix() const
+    {
+        std::vector<std::string> num_cols;
+        for (const auto &name : col_order_)
+        {
+            const std::string &t = col_types_.at(name);
+            if (t == "double" || t == "int64") num_cols.push_back(name);
+        }
+        const size_t k = num_cols.size();
+        GrizzlarFrame out;
+        std::vector<ulong> new_idx(k);
+        std::iota(new_idx.begin(), new_idx.end(), 0);
+        out.df_.load_index(std::move(new_idx));
+
+        out.col_order_.push_back("");
+        out.col_types_[""] = "string";
+        out.df_.load_column<std::string>("", std::vector<std::string>(num_cols.begin(), num_cols.end()));
+
+        for (size_t i = 0; i < k; ++i)
+        {
+            const std::string &ci = num_cols[i];
+            out.col_order_.push_back(ci);
+            out.col_types_[ci] = "double";
+            std::vector<double> col_vals(k);
+            for (size_t j = 0; j < k; ++j)
+                col_vals[j] = cov(ci, num_cols[j]);
+            out.df_.load_column<double>(ci.c_str(), std::move(col_vals));
+        }
+        return out;
+    }
+
+    // 28. filter_by_mask_list — filter using vector<bool> (no numpy required)
+    GrizzlarFrame filter_by_mask_list(const std::vector<bool> &mask) const
+    {
+        const auto &idx = df_.get_index();
+        const size_t n = idx.size();
+        if (mask.size() != n)
+            throw std::runtime_error("mask length " + std::to_string(mask.size()) +
+                                     " != frame length " + std::to_string(n));
+        std::vector<size_t> locs;
+        locs.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+            if (mask[i]) locs.push_back(i);
+        return extract_rows_parallel(locs);
+    }
+
 private:
     void write_cell(std::ofstream &out, const std::string &col, size_t row) const
     {
@@ -2772,7 +4027,38 @@ PYBIND11_MODULE(_grizzlars, m)
         .def("to_csv", &GrizzlarFrame::to_csv, py::arg("path"), py::arg("write_index") = true)
         // native C++ CSV loader (bypasses Python csv.DictReader for large files)
         .def_static("read_csv_native", &GrizzlarFrame::read_csv_native,
-                    py::arg("path"), py::arg("index_col") = "");
+                    py::arg("path"), py::arg("index_col") = "")
+        // new bulk operations
+        .def("isna_frame", &GrizzlarFrame::isna_frame)
+        .def("notna_frame", &GrizzlarFrame::notna_frame)
+        .def("ffill_col", &GrizzlarFrame::ffill_col, py::arg("col"))
+        .def("bfill_col", &GrizzlarFrame::bfill_col, py::arg("col"))
+        .def("clip_col", &GrizzlarFrame::clip_col, py::arg("col"), py::arg("lower"), py::arg("upper"))
+        .def("round_col", &GrizzlarFrame::round_col, py::arg("col"), py::arg("decimals"))
+        .def("abs_col", &GrizzlarFrame::abs_col, py::arg("col"))
+        .def("diff_col", &GrizzlarFrame::diff_col, py::arg("col"), py::arg("periods") = 1)
+        .def("isin_col", &GrizzlarFrame::isin_col, py::arg("col"), py::arg("values"))
+        .def("replace_col", &GrizzlarFrame::replace_col, py::arg("col"), py::arg("mapping"))
+        .def("replace_all_cols", &GrizzlarFrame::replace_all_cols, py::arg("mapping"))
+        .def("reduce_all", &GrizzlarFrame::reduce_all, py::arg("func"))
+        .def("arith_scalar", &GrizzlarFrame::arith_scalar, py::arg("op"), py::arg("scalar"))
+        .def("arith_frame_op", &GrizzlarFrame::arith_frame_op, py::arg("op"), py::arg("other"))
+        .def("compare_scalar", &GrizzlarFrame::compare_scalar, py::arg("op"), py::arg("scalar"))
+        .def("skew_col", &GrizzlarFrame::skew_col, py::arg("col"))
+        .def("kurt_col", &GrizzlarFrame::kurt_col, py::arg("col"))
+        .def("mode_col", &GrizzlarFrame::mode_col, py::arg("col"))
+        .def("duplicated_rows", &GrizzlarFrame::duplicated_rows, py::arg("cols"), py::arg("keep") = "first")
+        .def("melt_frame", &GrizzlarFrame::melt_frame,
+             py::arg("id_cols"), py::arg("val_cols"), py::arg("var_name") = "variable", py::arg("value_name") = "value")
+        .def("transpose_frame", &GrizzlarFrame::transpose_frame)
+        .def("set_index_col", &GrizzlarFrame::set_index_col, py::arg("col"), py::arg("drop") = true)
+        .def("reset_index_frame", &GrizzlarFrame::reset_index_frame, py::arg("drop") = false)
+        .def("astype_col", &GrizzlarFrame::astype_col, py::arg("col"), py::arg("target_type"))
+        .def("where_frame", &GrizzlarFrame::where_frame, py::arg("cond_frame"), py::arg("fill_val") = 0.0)
+        .def("corr_matrix", &GrizzlarFrame::corr_matrix)
+        .def("cov_matrix", &GrizzlarFrame::cov_matrix)
+        .def("filter_by_mask_list", &GrizzlarFrame::filter_by_mask_list, py::arg("mask"))
+        .def("take_rows", &GrizzlarFrame::take_rows, py::arg("indices"));
 
     // Thread-pool controls
     m.def("set_thread_level", [](long n)

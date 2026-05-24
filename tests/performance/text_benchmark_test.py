@@ -29,8 +29,6 @@ import gc
 import time
 from pathlib import Path
 
-import numpy as np
-
 import grizzlars as gl
 
 try:
@@ -84,12 +82,13 @@ def fmt_mb(mb: float) -> str:
 def _df_size_mb(df: "gl.DataFrame") -> float:
     total = 0
     for col in df.columns:
-        raw = df[col]
-        if isinstance(raw, np.ndarray):
-            total += raw.nbytes
+        col_type = df._frame.col_type(col)
+        if col_type in ("double", "int64", "bool"):
+            bytes_per = 8 if col_type in ("double", "int64") else 1
+            total += len(df) * bytes_per
         else:
-            total += sum(len(s) for s in raw)
-    total += df.index.nbytes
+            total += sum(len(s) for s in df[col])
+    total += len(df) * 8  # index: uint64 per row
     return total / 1024 / 1024
 
 

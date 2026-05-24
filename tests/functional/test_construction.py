@@ -14,5 +14,5 @@ def test_construct_from_numpy():
     x = np.array([1, 2, 3], dtype=np.int64)
     y = np.array([0.1, 0.2, 0.3], dtype=np.float64)
     df = gl.DataFrame({"x": x, "y": y})
-    assert df.dtypes()["x"] in ("int64",)
-    assert df.dtypes()["y"] in ("double",)
+    assert df.dtypes["x"] in ("int64",)
+    assert df.dtypes["y"] in ("double",)
