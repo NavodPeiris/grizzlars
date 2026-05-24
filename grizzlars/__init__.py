@@ -622,14 +622,17 @@ class DataFrame:
             idx = list(range(n)) if index is None else list(index)
             self._frame.load_index(idx)
             for name, values in data.items():
-                if isinstance(values, list):
-                    v = values
+                _np = _sys.modules.get("numpy")
+                if _np is not None and isinstance(values, _np.ndarray):
+                    self._frame.load_column(name, values)
+                elif isinstance(values, list):
+                    self._frame.load_column(name, values)
                 else:
                     try:
                         v = list(values)
                     except TypeError:
                         v = [values]
-                self._frame.load_column(name, v)
+                    self._frame.load_column(name, v)
 
     @classmethod
     def _from_frame(cls, frame: _GrizzlarFrame) -> "DataFrame":
