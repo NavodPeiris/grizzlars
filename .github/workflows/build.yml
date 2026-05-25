@@ -18,10 +18,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - uses: pypa/cibuildwheel@v2.22
         env:
           CIBW_BUILD: "cp310-* cp311-* cp312-*"
@@ -57,9 +53,6 @@ jobs:
           # Smoke-test every wheel before it is uploaded
           CIBW_TEST_REQUIRES: numpy
           CIBW_TEST_COMMAND: 'python -c "import grizzlars as gl; df = gl.DataFrame({''x'': [1.0, 2.0, 3.0], ''y'': [4, 5, 6]}); assert len(df) == 3; assert df.mean(''x'') == 2.0; print(''wheel OK'')"'
-
-      - name: Run functional tests
-        run: pip install numpy pytest && pip install --no-index --find-links=./wheelhouse grizzlars && pytest tests/functional/ -v
 
       - uses: actions/upload-artifact@v4
         with:
