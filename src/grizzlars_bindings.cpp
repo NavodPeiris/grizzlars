@@ -317,8 +317,24 @@ static bool csv_try_int64(const char *s, size_t len, int64_t &out)
 static bool csv_try_double(const char *s, size_t len, double &out)
 {
     if (!len) return false;
+#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION < 200000
+    // Apple libc++ before LLVM 20 (Xcode ≤ 15) lacks floating-point from_chars
+    char buf[64];
+    if (len < sizeof(buf)) {
+        std::memcpy(buf, s, len);
+        buf[len] = '\0';
+        char *e;
+        out = std::strtod(buf, &e);
+        return (size_t)(e - buf) == len;
+    }
+    std::string tmp(s, len);
+    char *e;
+    out = std::strtod(tmp.c_str(), &e);
+    return (size_t)(e - tmp.c_str()) == len;
+#else
     auto [end, ec] = std::from_chars(s, s + len, out);
     return ec == std::errc{} && end == s + len;
+#endif
 }
 
 static bool is_na_raw(const char *s, size_t len)
