@@ -377,7 +377,14 @@ class _ILocIndexer:
             n = len(self._df)
             i = key if key >= 0 else n + key
             return self._df._from_frame(self._df._frame.iloc(i, i + 1))
-        raise TypeError(f"iloc key must be int or slice, got {type(key)}")
+        # numpy integer array (sklearn CV fold indices) — order-preserving via numpy fancy-index
+        _np = _sys.modules.get("numpy")
+        if _np is not None and isinstance(key, _np.ndarray) and key.dtype.kind in ("i", "u"):
+            return _np.asarray(self._df)[key]
+        if isinstance(key, list) and key and isinstance(key[0], int):
+            import numpy as _np2
+            return _np2.asarray(self._df)[_np2.asarray(key, dtype=_np2.intp)]
+        raise TypeError(f"iloc key must be int, slice, or int array, got {type(key)}")
 
 
 class _LocIndexer:
@@ -405,11 +412,15 @@ class _LocIndexer:
             if isinstance(key, np.ndarray):
                 if key.dtype == bool or key.dtype == np.bool_:
                     return self._df._from_frame(self._df._frame.filter_by_mask(key))
-                positions = [idx.index(k) for k in key]
-                mask_list = [False] * len(idx)
-                for p in positions:
-                    mask_list[p] = True
-                return self._df._from_frame(self._df._frame.filter_by_mask_list(mask_list))
+                # Integer label array — O(n) dict lookup instead of O(n²) list.index
+                idx_map = {int(v): i for i, v in enumerate(idx)}
+                n = len(idx)
+                mask = np.zeros(n, dtype=np.bool_)
+                for k in key:
+                    p = idx_map.get(int(k))
+                    if p is not None:
+                        mask[p] = True
+                return self._df._from_frame(self._df._frame.filter_by_mask(mask))
         except ImportError:
             pass
         # Slice by label
@@ -852,7 +863,7 @@ class DataFrame:
         # get_column returns a numpy array for numeric types — no list round-trip needed
         arrays = [np.asarray(self._frame.get_column(c)) for c in cols]
         dtypes_set = {a.dtype.kind for a in arrays}
-        if len(dtypes_set) == 1 and dtypes_set <= {"f", "i", "u"}:
+        if dtypes_set <= {"f", "i", "u"}:  # all numeric — np.column_stack upcasts to float64
             return np.column_stack(arrays)
         out = np.empty((len(self), len(cols)), dtype=object)
         for j, a in enumerate(arrays):
