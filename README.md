@@ -16,6 +16,8 @@
 
 > A Python DataFrame library backed by a multithreaded C++ engine — built for speed.
 
+> More than **6x less memory** consumed on loading large CSVs compared to polars
+
 grizzlars wraps [DataFrame](https://github.com/hosseinmoein/DataFrame), a high-performance C++ DataFrame, with a clean Python API. Columns are stored as typed `std::vector<T>` buffers — no GIL-bound Python object overhead. Sort, filter, groupby, join, and aggregate operations run in parallel across all CPU cores automatically.
 
 ---
