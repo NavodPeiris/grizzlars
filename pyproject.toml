@@ -60,8 +60,18 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "ipykernel>=7.2.0",
+    "matplotlib>=3.10.9",
+    "nbformat>=5.10.4",
+    "numpy>=2.2.6",
+    "pandas>=2.3.3",
+    "plotly>=6.7.0",
     "polars>=1.40.1",
+    "pyarrow>=24.0.0",
     "pytest>=9.0.3",
+    "scikit-learn>=1.7.2",
+    "seaborn>=0.13.2",
+    "xgboost>=3.2.0",
 ]
 
 [build-system]

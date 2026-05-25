@@ -384,46 +384,34 @@ grizzlars is built for analytical workloads on large datasets:
 - **Join** — hash table probe O(n + m); parallel column scatter across all cores
 - **Aggregate / describe** — direct C++ vector reduction, no Python loop overhead
 
-Benchmark against polars on a 100 000-row customer dataset (12 columns, mixed string/numeric):
-
-| Operation  | grizzlars     |
-| ---------- | ------------- |
-| read_csv   | 2.41× faster  |
-| sort       | 1.33× faster  |
-| filter     | 24.93× faster |
-| groupby    | 2.69× faster  |
-| aggregate  | 20.39× faster |
-| describe   | 61.97× faster |
-| join inner | 2.15× slower  |
-| join left  | 4.07× slower  |
-
 Full test result:
+
+**Faster than polars in some scenarios and have significantly lower memory usage**
 
 ```
 ===============================================================================
   Customer data benchmark  —  grizzlars vs polars
-  Dataset: customers-100000.csv  (16912 KiB)
+  Dataset: customers-2000000.csv  (341227 KiB)
 ===============================================================================
 
-  Rows: 100,000    Columns: 12
+  Rows: 2,000,000    Columns: 12
 
   ── Load ──────────────────────────────────────────────────────────────
-  read_csv (customers)                       polars    76.13 ms   grizzlars    31.53 ms    → grizzlars is 2.41× faster
+  read_csv (customers)                       polars   253.72 ms   grizzlars   428.60 ms    → polars is 1.69x faster
 
   ── Memory ────────────────────────────────────────────────────────────
-  RSS delta after load                       polars      N/A   grizzlars      N/A
-  In-process data size                       polars    15.5 MiB   grizzlars    15.9 MiB
+  RSS delta after load                       polars   925.2 MiB   grizzlars   139.8 MiB
 
   ── Operations ────────────────────────────────────────────────────────
-  sort(Last Name asc)                        polars    45.97 ms   grizzlars    34.67 ms    → grizzlars is 1.33× faster
-  filter(Index > 50) → 99,950 rows           polars    26.17 ms   grizzlars     1.05 ms    → grizzlars is 24.93× faster
-  groupby Country → 243 groups               polars    13.79 ms   grizzlars     5.13 ms    → grizzlars is 2.69× faster
-  agg(mean/sum/std/min/max)                  polars     5.72 ms   grizzlars    280.4 µs    → grizzlars is 20.39× faster
-  describe                                   polars    23.60 ms   grizzlars    380.9 µs    → grizzlars is 61.97× faster
+  sort(Last Name asc)                        polars   291.14 ms   grizzlars   502.89 ms    → polars is 1.73x faster
+  filter(Index > 50) → 1,999,950 rows        polars    78.67 ms   grizzlars    54.02 ms    → grizzlars is 1.46x faster
+  groupby Country → 243 groups               polars   158.51 ms   grizzlars   103.29 ms    → grizzlars is 1.53x faster
+  agg(mean/sum/std/min/max)                  polars     8.92 ms   grizzlars     8.24 ms    → grizzlars is 1.08x faster
+  describe                                   polars    97.25 ms   grizzlars   255.81 ms    → polars is 2.63x faster
 
   ── Joins  (customers ⋈ people-100000.csv) ───────────────────────────
-  join inner → 100,000 rows                  polars    20.54 ms   grizzlars    44.12 ms    → polars is 2.15× faster
-  join left  → 100,000 rows (~50 000 unmatched) polars     9.90 ms   grizzlars    40.30 ms    → polars is 4.07× faster
+  join inner → 100,000 rows                  polars    30.66 ms   grizzlars   117.82 ms    → polars is 3.84x faster
+  join left  → 2,000,000 rows (~50 000 unmatched) polars    38.12 ms   grizzlars   277.43 ms    → polars is 7.28x faster
 
 ===============================================================================
 ```

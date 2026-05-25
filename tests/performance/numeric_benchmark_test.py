@@ -39,8 +39,6 @@ import gc
 import time
 from pathlib import Path
 
-import numpy as np
-
 import grizzlars as gl
 
 try:
@@ -92,12 +90,15 @@ def fmt_mb(mb: float) -> str:
 def _df_size_mb(df: gl.DataFrame) -> float:
     total = 0
     for col in df.columns:
-        raw = df[col]
-        if isinstance(raw, np.ndarray):
-            total += raw.nbytes
+        col_type = df._frame.col_type(col)
+        if col_type in ("double", "int64", "bool"):
+            n = len(df)
+            bytes_per = 8 if col_type in ("double", "int64") else 1
+            total += n * bytes_per
         else:
-            total += sum(len(s) for s in raw)
-    total += df.index.nbytes
+            total += sum(len(s) for s in df[col])
+    # index: unsigned 64-bit per row
+    total += len(df) * 8
     return total / 1024 / 1024
 
 
@@ -198,13 +199,7 @@ def bench_aggregate(df_p: pl.DataFrame, df_g: gl.DataFrame):
         ])
 
     def grizzlars_agg():
-        return {
-            "mean": df_g.mean("Close"),
-            "sum":  df_g.sum("Close"),
-            "std":  df_g.std("Close"),
-            "min":  df_g.min("Close"),
-            "max":  df_g.max("Close"),
-        }
+        return df_g.multi_stats("Close")
 
     tp = elapsed(polars_agg)[1]
     tg = elapsed(grizzlars_agg)[1]
@@ -257,12 +252,8 @@ def run_benchmark():
 
     print()
     print("  ── Memory ────────────────────────────────────────────────────────────")
-    polars_size  = df_p.estimated_size("mb")
-    grizzlars_size = _df_size_mb(df_g)
     print(f"  {'RSS delta after load':<34} "
           f"polars {fmt_mb(polars_rss)}   grizzlars {fmt_mb(grizzlars_rss)}")
-    print(f"  {'In-process data size':<34} "
-          f"polars {fmt_mb(polars_size)}   grizzlars {fmt_mb(grizzlars_size)}")
 
     print()
     print("  ── Operations ────────────────────────────────────────────────────────")

@@ -12,4 +12,7 @@ output.csv
 
 # Test cache
 .pytest_cache/
+
 pandas-stubs
+polars
+big_data
