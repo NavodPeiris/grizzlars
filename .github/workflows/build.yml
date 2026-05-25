@@ -7,39 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
-    name: Functional tests / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-14, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install TBB (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get install -y libtbb-dev
-
-      - name: Install TBB (macOS)
-        if: runner.os == 'macOS'
-        run: brew install tbb
-
-      - name: Install build deps & package
-        run: pip install numpy pytest scikit-build-core pybind11 && pip install --no-build-isolation -e .
-
-      - name: Run functional tests
-        run: pytest tests/functional/ -v
-
   build_wheels:
     name: Wheels / ${{ matrix.os }}
-    needs: [test]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -48,6 +17,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - uses: pypa/cibuildwheel@v2.22
         env:
@@ -85,6 +58,9 @@ jobs:
           CIBW_TEST_REQUIRES: numpy
           CIBW_TEST_COMMAND: 'python -c "import grizzlars as gl; df = gl.DataFrame({''x'': [1.0, 2.0, 3.0], ''y'': [4, 5, 6]}); assert len(df) == 3; assert df.mean(''x'') == 2.0; print(''wheel OK'')"'
 
+      - name: Run functional tests
+        run: pip install numpy pytest && pip install --no-index --find-links=./wheelhouse grizzlars && pytest tests/functional/ -v
+
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}
@@ -92,7 +68,6 @@ jobs:
 
   build_sdist:
     name: Source distribution
-    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
