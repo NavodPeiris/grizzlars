@@ -54,7 +54,7 @@ classifiers=[
 
 dependencies = [
     "numpy>=1.24",
-    "pybind11>=3.0.4",
+    "nanobind>=2.0.0",
     "scikit-build-core>=0.12.2",
 ]
 
@@ -75,7 +75,7 @@ dev = [
 ]
 
 [build-system]
-requires = ["scikit-build-core>=0.3.3", "pybind11>=2.11"]
+requires = ["scikit-build-core>=0.3.3", "nanobind>=2.0.0", "litgen>=0.20"]
 build-backend = "scikit_build_core.build"
 
 

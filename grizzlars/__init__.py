@@ -47,6 +47,67 @@ _OPS = {
     "!=": _op.ne,
 }
 
+# ── native column dtype dispatch ──────────────────────────────────────────────
+#
+# The native GrizzlarFrame (src/grizzlars_shim.h) exposes typed load_column_*/
+# get_column_* methods rather than one dynamically-typed pair — litgen needs
+# concrete, non-template signatures to generate bindings, so the runtime
+# type dispatch that used to live in C++ (detect_type()) now lives here.
+
+def _load_col(frame, name: str, values) -> None:
+    """Dispatch to the correctly-typed native load_column_* for *values*."""
+    _np = _sys.modules.get("numpy")
+    if _np is not None and isinstance(values, _np.ndarray):
+        kind = values.dtype.kind
+        if kind == "f":
+            frame.load_column_double(name, values.tolist())
+        elif kind in ("i", "u"):
+            frame.load_column_int64(name, values.tolist())
+        elif kind == "b":
+            frame.load_column_bool(name, values.astype("uint8").tolist())
+        else:
+            frame.load_column_string(name, [str(v) for v in values.tolist()])
+        return
+
+    vals = values if isinstance(values, list) else list(values)
+    if not vals:
+        frame.load_column_double(name, [])
+        return
+    first = vals[0]
+    if isinstance(first, bool):
+        frame.load_column_bool(name, [1 if v else 0 for v in vals])
+    elif isinstance(first, float):
+        frame.load_column_double(name, [float(v) for v in vals])
+    elif isinstance(first, int):
+        frame.load_column_int64(name, [int(v) for v in vals])
+    else:
+        frame.load_column_string(name, [str(v) for v in vals])
+
+
+def _mask_to_list(mask) -> list:
+    """Coerce a boolean mask (numpy array, pandas Series, or list-like) into
+    a plain list of 0/1 ints for filter_by_mask_list (nanobind's vector<T>
+    caster wants a Sequence, not an ndarray)."""
+    _np = _sys.modules.get("numpy")
+    if _np is not None and isinstance(mask, _np.ndarray):
+        return mask.astype("uint8").tolist()
+    return [1 if v else 0 for v in mask]
+
+
+def _get_col(frame, name: str):
+    """Dispatch to the correctly-typed native get_column_* for *name*."""
+    t = frame.col_type(name)
+    if t == "double":
+        import numpy as _np
+        return _np.asarray(frame.get_column_double(name))
+    if t == "int64":
+        import numpy as _np
+        return _np.asarray(frame.get_column_int64(name))
+    if t == "bool":
+        return list(frame.get_column_bool(name))
+    return list(frame.get_column_string(name))
+
+
 # ── display helpers ───────────────────────────────────────────────────────────
 
 def _is_nan(v) -> bool:
@@ -80,11 +141,11 @@ class _ColComparison:
     def to_mask(self) -> list:
         """Materialize to a bool list via C++ compare_col_scalar (if available)."""
         try:
-            return self._df._frame.compare_col_scalar(self._col, self._op, float(self._scalar))
+            return self._df._frame.compare_col_scalar_double(self._col, self._op, float(self._scalar))
         except (AttributeError, TypeError, ValueError, RuntimeError):
             pass
         fn = _OPS[self._op]
-        raw = self._df._frame.get_column(self._col)
+        raw = _get_col(self._df._frame, self._col)
         return [fn(v, self._scalar) if not (_is_nan(v) if isinstance(v, float) else False)
                 else False for v in raw]
 
@@ -167,7 +228,7 @@ class Series:
 
     def _get_data(self) -> list:
         if self._data is None:
-            self._data = self._src_frame._frame.get_column(self._src_col)
+            self._data = _get_col(self._src_frame._frame, self._src_col)
             if not isinstance(self._data, list):
                 self._data = list(self._data)
         return self._data
@@ -318,7 +379,7 @@ class _LazyFilterFrame:
                 mask_list = list(mask)
                 r = DataFrame._from_frame(source._frame.filter_by_mask_list(mask_list))
             else:
-                r = DataFrame._from_frame(source._frame.filter_by_mask(mask))
+                r = DataFrame._from_frame(source._frame.filter_by_mask_list(_mask_to_list(mask)))
             object.__setattr__(self, "_realized", r)
         return r
 
@@ -411,7 +472,7 @@ class _LocIndexer:
             import numpy as np
             if isinstance(key, np.ndarray):
                 if key.dtype == bool or key.dtype == np.bool_:
-                    return self._df._from_frame(self._df._frame.filter_by_mask(key))
+                    return self._df._from_frame(self._df._frame.filter_by_mask_list(_mask_to_list(key)))
                 # Integer label array — O(n) dict lookup instead of O(n²) list.index
                 idx_map = {int(v): i for i, v in enumerate(idx)}
                 n = len(idx)
@@ -420,7 +481,7 @@ class _LocIndexer:
                     p = idx_map.get(int(k))
                     if p is not None:
                         mask[p] = True
-                return self._df._from_frame(self._df._frame.filter_by_mask(mask))
+                return self._df._from_frame(self._df._frame.filter_by_mask_list(_mask_to_list(mask)))
         except ImportError:
             pass
         # Slice by label
@@ -528,8 +589,10 @@ class _GroupBy:
                 resolved[col] = fn
             has_callable = any(callable(v) for v in resolved.values())
             if not has_callable:
-                pairs = list(resolved.items())
-                return DataFrame._from_frame(self._df._frame.groupby_agg(self._by, pairs))
+                agg_cols = list(resolved.keys())
+                agg_funcs = list(resolved.values())
+                return DataFrame._from_frame(
+                    self._df._frame.groupby_agg(self._by, agg_cols, agg_funcs))
             return self._python_agg(resolved)
         raise TypeError(f"agg spec must be dict, str, or callable, got {type(spec)}")
 
@@ -635,15 +698,15 @@ class DataFrame:
             for name, values in data.items():
                 _np = _sys.modules.get("numpy")
                 if _np is not None and isinstance(values, _np.ndarray):
-                    self._frame.load_column(name, values)
+                    _load_col(self._frame, name, values)
                 elif isinstance(values, list):
-                    self._frame.load_column(name, values)
+                    _load_col(self._frame, name, values)
                 else:
                     try:
                         v = list(values)
                     except TypeError:
                         v = [values]
-                    self._frame.load_column(name, v)
+                    _load_col(self._frame, name, v)
 
     @classmethod
     def _from_frame(cls, frame: _GrizzlarFrame) -> "DataFrame":
@@ -664,7 +727,7 @@ class DataFrame:
         if isinstance(key, _ColComparison):
             try:
                 return DataFrame._from_frame(
-                    self._frame.filter_col_scalar(key._col, key._op, float(key._scalar))
+                    self._frame.filter_col_scalar_double(key._col, key._op, float(key._scalar))
                 )
             except (AttributeError, TypeError, ValueError, RuntimeError):
                 pass
@@ -680,11 +743,11 @@ class DataFrame:
         # numpy array support (optional) — use sys.modules to avoid slow cold import
         _np = _sys.modules.get("numpy")
         if _np is not None and isinstance(key, _np.ndarray) and (key.dtype == bool or key.dtype == _np.bool_):
-            return DataFrame._from_frame(self._frame.filter_by_mask(key))
+            return DataFrame._from_frame(self._frame.filter_by_mask_list(_mask_to_list(key)))
         # pandas Series support (optional) — use sys.modules to avoid slow cold import
         _pd = _sys.modules.get("pandas")
         if _pd is not None and isinstance(key, _pd.Series) and (str(key.dtype) in ("bool", "boolean")):
-            return DataFrame._from_frame(self._frame.filter_by_mask(key.to_numpy()))
+            return DataFrame._from_frame(self._frame.filter_by_mask_list(_mask_to_list(key.to_numpy())))
         # Slice → row range
         if isinstance(key, slice):
             total = len(self)
@@ -713,14 +776,14 @@ class DataFrame:
                 import numpy as _np
                 arr = _np.asarray(values)
                 for i, c in enumerate(col):
-                    self._frame.load_column(c, arr[:, i].tolist())
+                    _load_col(self._frame, c, arr[:, i].tolist())
                 return
             except ImportError:
                 pass
             # fallback: values is a list-of-lists / iterable of rows
             rows = list(values)
             for i, c in enumerate(col):
-                self._frame.load_column(c, [row[i] for row in rows])
+                _load_col(self._frame, c, [row[i] for row in rows])
             return
         if isinstance(values, list):
             v = values
@@ -729,7 +792,7 @@ class DataFrame:
                 v = list(values)
             except TypeError:
                 v = [values]
-        self._frame.load_column(col, v)
+        _load_col(self._frame, col, v)
 
     def __contains__(self, col: str) -> bool:
         return self._frame.has_column(col)
@@ -861,7 +924,7 @@ class DataFrame:
         if not cols:
             return np.empty((len(self), 0))
         # get_column returns a numpy array for numeric types — no list round-trip needed
-        arrays = [np.asarray(self._frame.get_column(c)) for c in cols]
+        arrays = [np.asarray(_get_col(self._frame, c)) for c in cols]
         dtypes_set = {a.dtype.kind for a in arrays}
         if dtypes_set <= {"f", "i", "u"}:  # all numeric — np.column_stack upcasts to float64
             return np.column_stack(arrays)
@@ -938,9 +1001,9 @@ class DataFrame:
             return {
                 "count": self._frame.count(col),
                 "mean":  self._frame.mean(col),
-                "std":   self._frame.std(col),
-                "min":   self._frame.min(col),
-                "max":   self._frame.max(col),
+                "std":   self._frame.std_dev(col),
+                "min":   self._frame.col_min(col),
+                "max":   self._frame.col_max(col),
                 "sum":   self._frame.sum(col),
             }
 
@@ -971,7 +1034,7 @@ class DataFrame:
                 if n < 2: return 0.0
                 m = sum(raw) / n
                 return _math.sqrt(sum((v - m)**2 for v in raw) / (n - 1))
-            return self._frame.std(col)
+            return self._frame.std_dev(col)
         return DataFrame._from_frame(self._frame.reduce_all("std"))
 
     def min(self, col: Optional[str] = None):
@@ -980,7 +1043,7 @@ class DataFrame:
             if self._frame.col_type(col) == "bool":
                 raw = list(self[col])
                 return 0.0 if any(not v for v in raw) else 1.0
-            return self._frame.min(col)
+            return self._frame.col_min(col)
         return DataFrame._from_frame(self._frame.reduce_all("min"))
 
     def max(self, col: Optional[str] = None):
@@ -989,7 +1052,7 @@ class DataFrame:
             if self._frame.col_type(col) == "bool":
                 raw = list(self[col])
                 return 1.0 if any(v for v in raw) else 0.0
-            return self._frame.max(col)
+            return self._frame.col_max(col)
         return DataFrame._from_frame(self._frame.reduce_all("max"))
 
     def count(self, col: Optional[str] = None):
@@ -1117,7 +1180,12 @@ class DataFrame:
 
     def mode(self, col: str):
         """Return the most frequent value(s) in *col* — delegates to C++."""
-        return list(self._frame.mode_col(col))
+        t = self._frame.col_type(col)
+        if t == "double":
+            return list(self._frame.mode_col_double(col))
+        if t == "int64":
+            return list(self._frame.mode_col_int64(col))
+        return list(self._frame.mode_col_string(col))
 
     def describe(self) -> "DataFrame":
         """
@@ -1223,7 +1291,12 @@ class DataFrame:
 
     def unique(self, col: str):
         """Sorted unique values in *col*."""
-        return self._frame.unique_values(col)
+        t = self._frame.col_type(col)
+        if t == "double":
+            return self._frame.unique_double(col)
+        if t == "int64":
+            return self._frame.unique_int64(col)
+        return self._frame.unique_string(col)
 
     def n_missing(self, col: str) -> int:
         """Count of NaN / empty-string values in *col*."""
@@ -1231,7 +1304,12 @@ class DataFrame:
 
     def value_counts(self, col: str) -> "DataFrame":
         """Return a DataFrame with ["value", "count"] sorted by count descending."""
-        return DataFrame._from_frame(self._frame.value_counts(col))
+        t = self._frame.col_type(col)
+        if t == "double":
+            return DataFrame._from_frame(self._frame.value_counts_double(col))
+        if t == "int64":
+            return DataFrame._from_frame(self._frame.value_counts_int64(col))
+        return DataFrame._from_frame(self._frame.value_counts_string(col))
 
     # ── boolean reductions ────────────────────────────────────────────────────
 
@@ -1337,7 +1415,7 @@ class DataFrame:
             if isinstance(mask, _ColComparison):
                 try:
                     return DataFrame._from_frame(
-                        self._frame.filter_col_scalar(mask._col, mask._op, float(mask._scalar))
+                        self._frame.filter_col_scalar_double(mask._col, mask._op, float(mask._scalar))
                     )
                 except (AttributeError, TypeError, ValueError, RuntimeError):
                     pass
@@ -1362,7 +1440,7 @@ class DataFrame:
             # Fast C++ path for col+op+scalar
             try:
                 return DataFrame._from_frame(
-                    self._frame.filter_col_scalar(col_or_mask, op, float(value))
+                    self._frame.filter_col_scalar_double(col_or_mask, op, float(value))
                 )
             except (AttributeError, TypeError, ValueError, RuntimeError):
                 pass
@@ -1423,7 +1501,10 @@ class DataFrame:
 
     def isin(self, col: str, values) -> list:
         """Return a bool list: True where *col* value is in *values*."""
-        return self._frame.isin_col(col, values)
+        t = self._frame.col_type(col)
+        if t == "string":
+            return list(self._frame.isin_col_string(col, [str(v) for v in values]))
+        return list(self._frame.isin_col_double(col, [float(v) for v in values]))
 
     def duplicated(self, subset=None, keep: str = "first") -> list:
         """Return a bool list marking duplicate rows."""
@@ -1434,7 +1515,7 @@ class DataFrame:
         """Return a new DataFrame with *name* column added / replaced (non-mutating)."""
         result = self._copy()
         v = values if isinstance(values, list) else list(values)
-        result._frame.load_column(name, v)
+        _load_col(result._frame, name, v)
         return result
 
     def assign(self, **kwargs) -> "DataFrame":
@@ -1442,13 +1523,13 @@ class DataFrame:
         result = self._copy()
         for name, values in kwargs.items():
             v = values if isinstance(values, list) else list(values)
-            result._frame.load_column(name, v)
+            _load_col(result._frame, name, v)
         return result
 
     def insert(self, loc: int, column: str, value) -> None:
         """Insert a column at integer position *loc* (in-place)."""
         v = value if isinstance(value, list) else list(value)
-        self._frame.load_column(column, v)
+        _load_col(self._frame, column, v)
         cols = self.columns
         if column in cols:
             cols.remove(column)
@@ -1473,7 +1554,7 @@ class DataFrame:
         """Iterate over (index_label, row_dict) pairs."""
         idx = list(self.index)
         cols = self.columns
-        col_data = {col: self._frame.get_column(col) for col in cols}
+        col_data = {col: _get_col(self._frame, col) for col in cols}
         for i in range(len(self)):
             row = {col: col_data[col][i] for col in cols}
             yield int(idx[i]), row
@@ -1486,7 +1567,7 @@ class DataFrame:
         fields = (["Index"] + safe_cols) if index else safe_cols
         Row = namedtuple(name or "Row", fields)
         idx = list(self.index)
-        col_data = {col: self._frame.get_column(col) for col in cols}
+        col_data = {col: _get_col(self._frame, col) for col in cols}
         for i in range(len(self)):
             vals = [col_data[col][i] for col in cols]
             if index:
@@ -1588,7 +1669,7 @@ class DataFrame:
             return DataFrame({k: [v] for k, v in result.items()})
         else:
             cols = self.columns
-            col_data = {col: self._frame.get_column(col) for col in cols}
+            col_data = {col: _get_col(self._frame, col) for col in cols}
             rows = []
             for i in range(len(self)):
                 row = {col: col_data[col][i] for col in cols}
@@ -1640,7 +1721,7 @@ class DataFrame:
         rk = [right_key] if isinstance(right_key, str) else right_key
 
         right_rows: dict = {}
-        rk_data = {c: other._frame.get_column(c) for c in rk}
+        rk_data = {c: _get_col(other._frame, c) for c in rk}
         for i in range(len(other)):
             key = tuple(rk_data[c][i] for c in rk)
             right_rows.setdefault(key, []).append(i)
@@ -1653,9 +1734,9 @@ class DataFrame:
             out_col = c if c not in out else c + suffixes[1]
             out[out_col] = []
 
-        lk_data = {c: self._frame.get_column(c) for c in lk}
-        lcols_data = {c: self._frame.get_column(c) for c in lcols}
-        rcols_data = {c: other._frame.get_column(c) for c in rcols}
+        lk_data = {c: _get_col(self._frame, c) for c in lk}
+        lcols_data = {c: _get_col(self._frame, c) for c in lcols}
+        rcols_data = {c: _get_col(other._frame, c) for c in rcols}
         matched_right: set = set()
         for i in range(len(self)):
             key = tuple(lk_data[c][i] for c in lk)
@@ -1775,7 +1856,11 @@ class DataFrame:
 
     def fillna(self, col: str, value) -> "DataFrame":
         """Fill NaN / empty values in *col* with *value* (in-place; returns self)."""
-        self._frame.fillna(col, value)
+        t = self._frame.col_type(col)
+        if t == "string":
+            self._frame.fillna_string(col, str(value))
+        else:
+            self._frame.fillna_double(col, float(value))
         return self
 
     def ffill(self, col: str) -> "DataFrame":
@@ -1796,11 +1881,16 @@ class DataFrame:
         # Cross-type: string column → numeric values; replace then astype
         if col_type == "string" and isinstance(val_sample, (int, float)):
             str_mapping = {str(k): str(v) for k, v in mapping.items()}
-            self._frame.replace_col(col_name, str_mapping)
+            self._frame.replace_col_string(col_name, list(str_mapping.keys()), list(str_mapping.values()))
             target_type = "int64" if all(isinstance(v, int) for v in mapping.values()) else "double"
             self._frame.astype_col(col_name, target_type)
+        elif col_type == "string":
+            self._frame.replace_col_string(col_name, [str(k) for k in mapping.keys()], [str(v) for v in mapping.values()])
         else:
-            self._frame.replace_col(col_name, mapping)
+            self._frame.replace_col_double(
+                col_name,
+                [float(k) for k in mapping.keys()],
+                [float(v) for v in mapping.values()])
 
     def replace(
         self,
@@ -2067,9 +2157,9 @@ class DataFrame:
         col_keys = sorted(set(self[columns]))
         from collections import defaultdict
         groups: dict = defaultdict(list)
-        idx_col = self._frame.get_column(index)
-        col_col = self._frame.get_column(columns)
-        val_col = self._frame.get_column(values)
+        idx_col = _get_col(self._frame, index)
+        col_col = _get_col(self._frame, columns)
+        val_col = _get_col(self._frame, values)
         for i in range(len(self)):
             rk = idx_col[i]
             ck = col_col[i]
@@ -2266,7 +2356,7 @@ class DataFrame:
         show = min(rows, 10)
         idx = list(self.index)
         # Pre-load all column data once (avoid O(show×ncols) lazy loads)
-        col_data = {col: self._frame.get_column(col) for col in cols}
+        col_data = {col: _get_col(self._frame, col) for col in cols}
         for i in range(show):
             row = f"{idx[i]:>{idx_w}}"
             for col in cols:
@@ -2305,7 +2395,7 @@ class DataFrame:
         html += ["</tr>", "</thead>", "<tbody>"]
 
         # Pre-load all column data once
-        col_data = {col: self._frame.get_column(col) for col in cols}
+        col_data = {col: _get_col(self._frame, col) for col in cols}
         for i in range(show):
             row_bg = "#fff" if i % 2 == 0 else "#fafafa"
             html.append(f'<tr style="background:{row_bg};">')
@@ -2466,9 +2556,9 @@ def get_dummies(
         for uv in unique_vals:
             new_col = f"{pfx}{prefix_sep}{uv}"
             if uv == "<NA>":
-                result._frame.load_column(new_col, [1 if (v == "" or v is None) else 0 for v in col_vals])
+                _load_col(result._frame, new_col, [1 if (v == "" or v is None) else 0 for v in col_vals])
             else:
-                result._frame.load_column(new_col, [1 if v == uv else 0 for v in col_vals])
+                _load_col(result._frame, new_col, [1 if v == uv else 0 for v in col_vals])
 
         result._frame.drop_column(col)
 
