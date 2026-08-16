@@ -7,6 +7,10 @@ class GrizzlarFrame:
         pass
 
     # ── construction / loading ────────────────────────────────────────────
+    # Taken by value (not const&): nanobind already materializes a fresh
+    # std::vector<T> converting from the Python list/array regardless, so
+    # taking it by value costs nothing extra and lets the implementation
+    # std::move it straight into hmdf's storage instead of copying again.
     def load_index(self, indices: List[int]) -> None:
         pass
     def load_column_double(self, name: str, values: List[float]) -> None:

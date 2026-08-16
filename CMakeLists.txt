@@ -6,6 +6,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
+# Whole-program / link-time optimization, applied globally so it also covers
+# the hmdf DataFrame::DataFrame target below (set before add_subdirectory,
+# without touching cpp_lib/DataFrame's own CMakeLists.txt). CMake's own
+# INTERPROCEDURAL_OPTIMIZATION abstraction is used instead of hand-rolling
+# per-compiler flags (/GL) because it correctly pairs /GL with /LTCG on the
+# *link* step for MSVC — without an explicit /LTCG, link.exe was silently
+# restarting itself every build ("module compiled with /GL found;
+# restarting link with /LTCG"), doing the same optimization but slower to
+# build. On GCC/Clang it emits -flto, which was previously not enabled at
+# all outside MSVC.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
+if(IPO_SUPPORTED)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+else()
+    message(STATUS "IPO/LTO not supported by this toolchain: ${IPO_ERROR}")
+endif()
+
 # nanobind ships its CMake config inside the pip package itself — locate it
 # via the same interpreter scikit-build-core is using to build the wheel.
 execute_process(
@@ -57,9 +75,10 @@ target_link_libraries(_grizzlars PRIVATE DataFrame::DataFrame)
 if(MSVC)
     # /O2        full speed optimisation (MSVC has no /O3)
     # /Oi        replace eligible function calls with intrinsics
-    # /GL        whole-program optimisation (link-time inlining across TUs)
     # /fp:precise keep IEEE 754 NaN/Inf behaviour — do NOT use /fp:fast
-    target_compile_options(_grizzlars PRIVATE /O2 /Oi /GL /fp:precise /bigobj)
+    # (whole-program/link-time optimisation is /GL+/LTCG, applied globally
+    # above via CMAKE_INTERPROCEDURAL_OPTIMIZATION instead of by hand here)
+    target_compile_options(_grizzlars PRIVATE /O2 /Oi /fp:precise /bigobj)
     target_compile_definitions(_grizzlars PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
 else()
     if(PORTABLE_BUILD)

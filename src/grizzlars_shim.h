@@ -24,11 +24,15 @@ public:
     GrizzlarFrame() = default;
 
     // ── construction / loading ────────────────────────────────────────────
-    void load_index(const std::vector<uint64_t> & indices);
-    void load_column_double(const std::string & name, const std::vector<double> & values);
-    void load_column_int64(const std::string & name, const std::vector<int64_t> & values);
-    void load_column_bool(const std::string & name, const std::vector<uint8_t> & values);
-    void load_column_string(const std::string & name, const std::vector<std::string> & values);
+    // Taken by value (not const&): nanobind already materializes a fresh
+    // std::vector<T> converting from the Python list/array regardless, so
+    // taking it by value costs nothing extra and lets the implementation
+    // std::move it straight into hmdf's storage instead of copying again.
+    void load_index(std::vector<uint64_t> indices);
+    void load_column_double(const std::string & name, std::vector<double> values);
+    void load_column_int64(const std::string & name, std::vector<int64_t> values);
+    void load_column_bool(const std::string & name, std::vector<uint8_t> values);
+    void load_column_string(const std::string & name, std::vector<std::string> values);
 
     // ── accessors ──────────────────────────────────────────────────────────
     GrizzlarFrame deep_copy() const;

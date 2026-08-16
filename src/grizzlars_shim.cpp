@@ -1,6 +1,7 @@
 #include "grizzlars_shim.h"
 
 #include <DataFrame/DataFrameStatsVisitors.h>
+#include <DataFrame/Utils/Threads/ThreadGranularity.h>
 
 #include <algorithm>
 #include <charconv>
@@ -8,39 +9,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <set>
 #include <sstream>
 #include <stdexcept>
-#include <thread>
 #include <typeindex>
 #include <unordered_map>
-
-#if defined(__has_include)
-#if __has_include(<execution>)
-#include <execution>
-#if defined(__cpp_lib_execution)
-#define GRIZZLAR_USE_EXECUTION 1
-#endif
-#endif
-#endif
-
-// Parallel std::sort, when the standard library supports execution
-// policies (MSVC's STL does out of the box, no TBB needed) — falls back
-// to a plain serial sort otherwise. hmdf's own sort<T,Ts...>() uses its
-// internal ThreadPool::parallel_sort, so a single-threaded std::sort here
-// was consistently slower on string-heavy columns; this closes that gap
-// without touching cpp_lib/DataFrame.
-#if defined(GRIZZLAR_USE_EXECUTION)
-#ifdef __APPLE__
-#define GRIZZLAR_SORT_POLICY std::execution::seq
-#else
-#define GRIZZLAR_SORT_POLICY std::execution::par
-#endif
-#define GRIZZLAR_SORT(...) std::sort(GRIZZLAR_SORT_POLICY, __VA_ARGS__)
-#else
-#define GRIZZLAR_SORT(...) std::sort(__VA_ARGS__)
-#endif
 
 using hmdf::nan_policy;
 using ulong = unsigned long;
@@ -77,44 +52,47 @@ const std::string & require_numeric(
 
 } // namespace
 
-void GrizzlarFrame::load_index(const std::vector<uint64_t> & indices)
+void GrizzlarFrame::load_index(std::vector<uint64_t> indices)
 {
+    // uint64_t -> unsigned long is a genuine narrowing/widening conversion
+    // (they differ in width under LLP64), not just a copy, so this pass
+    // can't be avoided by moving.
     std::vector<unsigned long> idx(indices.begin(), indices.end());
     df_.load_index(std::move(idx));
 }
 
-void GrizzlarFrame::load_column_double(const std::string & name, const std::vector<double> & values)
+void GrizzlarFrame::load_column_double(const std::string & name, std::vector<double> values)
 {
-    df_.load_column<double>(name.c_str(), values, nan_policy::pad_with_nans);
+    df_.load_column<double>(name.c_str(), std::move(values), nan_policy::pad_with_nans);
     if (col_types_.find(name) == col_types_.end())
         col_order_.push_back(name);
     col_types_[name] = "double";
 }
 
-void GrizzlarFrame::load_column_int64(const std::string & name, const std::vector<int64_t> & values)
+void GrizzlarFrame::load_column_int64(const std::string & name, std::vector<int64_t> values)
 {
-    df_.load_column<int64_t>(name.c_str(), values, nan_policy::pad_with_nans);
+    df_.load_column<int64_t>(name.c_str(), std::move(values), nan_policy::pad_with_nans);
     if (col_types_.find(name) == col_types_.end())
         col_order_.push_back(name);
     col_types_[name] = "int64";
 }
 
-void GrizzlarFrame::load_column_bool(const std::string & name, const std::vector<uint8_t> & values)
+void GrizzlarFrame::load_column_bool(const std::string & name, std::vector<uint8_t> values)
 {
     // Stored as uint8_t, not bool: hmdf's generic sort/permutation code does
     // an internal std::swap() on column elements, and std::vector<bool>'s
     // bit-packed proxy reference doesn't satisfy std::swap() under MSVC's
     // STL. uint8_t avoids the footgun entirely while keeping the Python-
     // facing dtype label "bool" (see get_column_bool / col_types_).
-    df_.load_column<uint8_t>(name.c_str(), values, nan_policy::pad_with_nans);
+    df_.load_column<uint8_t>(name.c_str(), std::move(values), nan_policy::pad_with_nans);
     if (col_types_.find(name) == col_types_.end())
         col_order_.push_back(name);
     col_types_[name] = "bool";
 }
 
-void GrizzlarFrame::load_column_string(const std::string & name, const std::vector<std::string> & values)
+void GrizzlarFrame::load_column_string(const std::string & name, std::vector<std::string> values)
 {
-    df_.load_column<std::string>(name.c_str(), values, nan_policy::pad_with_nans);
+    df_.load_column<std::string>(name.c_str(), std::move(values), nan_policy::pad_with_nans);
     if (col_types_.find(name) == col_types_.end())
         col_order_.push_back(name);
     col_types_[name] = "string";
@@ -574,8 +552,8 @@ GrizzlarFrame GrizzlarFrame::value_counts_double(const std::string & col) const
     std::vector<int64_t> counts(counted.size());
     for (size_t i = 0; i < counted.size(); ++i) { idx[i] = static_cast<unsigned long>(i); values[i] = counted[i].first; counts[i] = static_cast<int64_t>(counted[i].second); }
     out.df_.load_index(std::move(idx));
-    out.df_.load_column<double>("value", values);
-    out.df_.load_column<int64_t>("count", counts);
+    out.df_.load_column<double>("value", std::move(values));
+    out.df_.load_column<int64_t>("count", std::move(counts));
     out.col_order_ = { "value", "count" };
     out.col_types_ = { {"value", "double"}, {"count", "int64"} };
     return out;
@@ -592,8 +570,8 @@ GrizzlarFrame GrizzlarFrame::value_counts_int64(const std::string & col) const
     std::vector<int64_t> counts(counted.size());
     for (size_t i = 0; i < counted.size(); ++i) { idx[i] = static_cast<unsigned long>(i); values[i] = counted[i].first; counts[i] = static_cast<int64_t>(counted[i].second); }
     out.df_.load_index(std::move(idx));
-    out.df_.load_column<int64_t>("value", values);
-    out.df_.load_column<int64_t>("count", counts);
+    out.df_.load_column<int64_t>("value", std::move(values));
+    out.df_.load_column<int64_t>("count", std::move(counts));
     out.col_order_ = { "value", "count" };
     out.col_types_ = { {"value", "int64"}, {"count", "int64"} };
     return out;
@@ -610,8 +588,8 @@ GrizzlarFrame GrizzlarFrame::value_counts_string(const std::string & col) const
     std::vector<int64_t> counts(counted.size());
     for (size_t i = 0; i < counted.size(); ++i) { idx[i] = static_cast<unsigned long>(i); values[i] = counted[i].first; counts[i] = static_cast<int64_t>(counted[i].second); }
     out.df_.load_index(std::move(idx));
-    out.df_.load_column<std::string>("value", values);
-    out.df_.load_column<int64_t>("count", counts);
+    out.df_.load_column<std::string>("value", std::move(values));
+    out.df_.load_column<int64_t>("count", std::move(counts));
     out.col_order_ = { "value", "count" };
     out.col_types_ = { {"value", "string"}, {"count", "int64"} };
     return out;
@@ -649,14 +627,23 @@ namespace
 // specifically because hmdf's own get_data_by_loc gathers std::string
 // columns element-by-element and, for large mostly-string DataFrames,
 // that dominates filter/iloc/take_rows wall-clock time — the per-element
-// work is embarrassingly parallel regardless of column type, so this
-// just does the same gather with real worker threads.
+// work is embarrassingly parallel regardless of column type.
+//
+// Dispatches onto hmdf's own already-running ThreadGranularity::thr_pool_
+// (started once at module import via set_optimum_thread_level()) via
+// parallel_loop(), rather than spawning fresh std::thread objects per
+// call — an earlier version did the latter, which meant up to 16 new OS
+// threads created *per column* (up to ~190 thread creations for one
+// 12-column filter). A/B measured directly: single-threaded gather took
+// 827ms on a 2M-row mostly-string filter; spawning fresh threads got that
+// to ~360ms; reusing the existing pool via parallel_loop avoids paying
+// thread-creation cost on every single call.
 template <typename T, typename GetFn>
 std::vector<T> parallel_gather(const std::vector<long> & positions, size_t src_size, GetFn && get)
 {
     const size_t n = positions.size();
     std::vector<T> out(n);
-    auto run = [&](size_t begin, size_t end)
+    auto routine = [&](size_t begin, size_t end) -> void
     {
         for (size_t i = begin; i < end; ++i)
         {
@@ -666,24 +653,13 @@ std::vector<T> parallel_gather(const std::vector<long> & positions, size_t src_s
         }
     };
 
-    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    const size_t n_threads = (n >= 20000) ? std::min<size_t>(hw, 16) : 1;
-    if (n_threads <= 1)
+    if (n < 20000)
     {
-        run(0, n);
+        routine(0, n);
         return out;
     }
-    const size_t chunk = (n + n_threads - 1) / n_threads;
-    std::vector<std::thread> threads;
-    threads.reserve(n_threads);
-    for (size_t t = 0; t < n_threads; ++t)
-    {
-        const size_t begin = t * chunk;
-        const size_t end = std::min(n, begin + chunk);
-        if (begin >= end) continue;
-        threads.emplace_back(run, begin, end);
-    }
-    for (auto & th : threads) th.join();
+    auto futures = hmdf::ThreadGranularity::thr_pool_.parallel_loop<T>(size_t(0), n, routine);
+    for (auto & fut : futures) fut.get();
     return out;
 }
 
@@ -748,28 +724,28 @@ GrizzlarFrame GrizzlarFrame::sort_by(const std::string & by, bool ascending) con
     if (type == "double")
     {
         const auto & c = df_.get_column<double>(by.c_str());
-        GRIZZLAR_SORT(perm.begin(), perm.end(), [&](long a, long b) {
+        hmdf::ThreadGranularity::thr_pool_.parallel_sort(perm.begin(), perm.end(), [&](long a, long b) {
             return ascending ? c[a] < c[b] : c[a] > c[b];
         });
     }
     else if (type == "int64")
     {
         const auto & c = df_.get_column<int64_t>(by.c_str());
-        GRIZZLAR_SORT(perm.begin(), perm.end(), [&](long a, long b) {
+        hmdf::ThreadGranularity::thr_pool_.parallel_sort(perm.begin(), perm.end(), [&](long a, long b) {
             return ascending ? c[a] < c[b] : c[a] > c[b];
         });
     }
     else if (type == "bool")
     {
         const auto & c = df_.get_column<uint8_t>(by.c_str());
-        GRIZZLAR_SORT(perm.begin(), perm.end(), [&](long a, long b) {
+        hmdf::ThreadGranularity::thr_pool_.parallel_sort(perm.begin(), perm.end(), [&](long a, long b) {
             return ascending ? c[a] < c[b] : c[a] > c[b];
         });
     }
     else
     {
         const auto & c = df_.get_column<std::string>(by.c_str());
-        GRIZZLAR_SORT(perm.begin(), perm.end(), [&](long a, long b) {
+        hmdf::ThreadGranularity::thr_pool_.parallel_sort(perm.begin(), perm.end(), [&](long a, long b) {
             return ascending ? c[a] < c[b] : c[a] > c[b];
         });
     }
@@ -782,7 +758,7 @@ GrizzlarFrame GrizzlarFrame::sort_index(bool ascending) const
     const size_t n = idx.size();
     std::vector<long> perm(n);
     for (size_t i = 0; i < n; ++i) perm[i] = static_cast<long>(i);
-    GRIZZLAR_SORT(perm.begin(), perm.end(), [&](long a, long b) {
+    hmdf::ThreadGranularity::thr_pool_.parallel_sort(perm.begin(), perm.end(), [&](long a, long b) {
         return ascending ? idx[a] < idx[b] : idx[a] > idx[b];
     });
     return from_positions(perm);
@@ -895,17 +871,14 @@ void GrizzlarFrame::sync_from_df()
 namespace
 {
 
-double read_numeric_at(const hmdf::StdDataFrame<unsigned long> & df,
-                       const std::string & type, const std::string & col, size_t row)
-{
-    if (type == "double")
-        return df.get_column<double>(col.c_str())[row];
-    return static_cast<double>(df.get_column<int64_t>(col.c_str())[row]);
-}
-
-double aggregate_group(const hmdf::StdDataFrame<unsigned long> & df,
-                       const std::string & type, const std::string & col,
-                       const std::vector<size_t> & rows, const std::string & func)
+// `at(row)` is a pre-bound accessor into an already-fetched column
+// reference — aggregate_group() must NOT call get_column<T>() itself,
+// since that's invoked once per row *within* each group otherwise (a real
+// measured cost: get_column<T> re-does a name lookup, and possibly a
+// lock, on every call — for a 49k-row/11-group groupby that's tens of
+// thousands of redundant lookups instead of one per column).
+template <typename Accessor>
+double aggregate_group(Accessor && at, const std::vector<size_t> & rows, const std::string & func)
 {
     const size_t cnt = rows.size();
     if (func == "count")
@@ -913,16 +886,16 @@ double aggregate_group(const hmdf::StdDataFrame<unsigned long> & df,
     if (cnt == 0)
         return 0.0;
     if (func == "first")
-        return read_numeric_at(df, type, col, rows.front());
+        return at(rows.front());
     if (func == "last")
-        return read_numeric_at(df, type, col, rows.back());
+        return at(rows.back());
 
     double s = 0.0;
-    double mn = read_numeric_at(df, type, col, rows[0]);
+    double mn = at(rows[0]);
     double mx = mn;
     for (size_t r : rows)
     {
-        const double v = read_numeric_at(df, type, col, r);
+        const double v = at(r);
         s += v;
         mn = std::min(mn, v);
         mx = std::max(mx, v);
@@ -938,7 +911,7 @@ double aggregate_group(const hmdf::StdDataFrame<unsigned long> & df,
         double sq = 0.0;
         for (size_t r : rows)
         {
-            const double d = read_numeric_at(df, type, col, r) - m;
+            const double d = at(r) - m;
             sq += d * d;
         }
         return std::sqrt(sq / static_cast<double>(cnt - 1));
@@ -963,23 +936,23 @@ GrizzlarFrame GrizzlarFrame::groupby_agg(
     // spec (hmdf's groupby1/2/3 require the aggregation spec to be known at
     // compile time via variadic template args) — the bucketing below is
     // straightforward bookkeeping; the actual aggregation math still reads
-    // directly from df_'s real column storage via read_numeric_at() above.
+    // directly from df_'s real column storage.
+    //
+    // The by_col column reference is fetched once *before* the loop (not
+    // once per row inside it, as an earlier version did) — get_column<T>
+    // does a name lookup on every call, and doing that 49k+ times measured
+    // as a real chunk of groupby's wall-clock time on medium-size data.
     std::vector<std::string> group_keys;
     std::unordered_map<std::string, size_t> key_to_group;
+    key_to_group.reserve(n / 4 + 8);
     std::vector<std::vector<size_t>> group_rows;
 
-    for (size_t i = 0; i < n; ++i)
+    auto bucket = [&](const std::string & key, size_t i)
     {
-        std::string key;
-        if (by_type == "double")      key = std::to_string(df_.get_column<double>(by_col.c_str())[i]);
-        else if (by_type == "int64")  key = std::to_string(df_.get_column<int64_t>(by_col.c_str())[i]);
-        else if (by_type == "bool")   key = std::to_string(df_.get_column<uint8_t>(by_col.c_str())[i]);
-        else                          key = df_.get_column<std::string>(by_col.c_str())[i];
-
         auto it = key_to_group.find(key);
         if (it == key_to_group.end())
         {
-            key_to_group[key] = group_keys.size();
+            key_to_group.emplace(key, group_keys.size());
             group_keys.push_back(key);
             group_rows.emplace_back(std::vector<size_t>{ i });
         }
@@ -987,6 +960,27 @@ GrizzlarFrame GrizzlarFrame::groupby_agg(
         {
             group_rows[it->second].push_back(i);
         }
+    };
+
+    if (by_type == "double")
+    {
+        const auto & c = df_.get_column<double>(by_col.c_str());
+        for (size_t i = 0; i < n; ++i) bucket(std::to_string(c[i]), i);
+    }
+    else if (by_type == "int64")
+    {
+        const auto & c = df_.get_column<int64_t>(by_col.c_str());
+        for (size_t i = 0; i < n; ++i) bucket(std::to_string(c[i]), i);
+    }
+    else if (by_type == "bool")
+    {
+        const auto & c = df_.get_column<uint8_t>(by_col.c_str());
+        for (size_t i = 0; i < n; ++i) bucket(std::to_string(c[i]), i);
+    }
+    else
+    {
+        const auto & c = df_.get_column<std::string>(by_col.c_str());
+        for (size_t i = 0; i < n; ++i) bucket(c[i], i);
     }
 
     const size_t ngroups = group_keys.size();
@@ -1002,25 +996,25 @@ GrizzlarFrame GrizzlarFrame::groupby_agg(
     {
         std::vector<double> vals(ngroups);
         for (size_t g = 0; g < ngroups; ++g) vals[g] = df_.get_column<double>(by_col.c_str())[group_rows[g].front()];
-        out.df_.load_column<double>(by_col.c_str(), vals);
+        out.df_.load_column<double>(by_col.c_str(), std::move(vals));
     }
     else if (by_type == "int64")
     {
         std::vector<int64_t> vals(ngroups);
         for (size_t g = 0; g < ngroups; ++g) vals[g] = df_.get_column<int64_t>(by_col.c_str())[group_rows[g].front()];
-        out.df_.load_column<int64_t>(by_col.c_str(), vals);
+        out.df_.load_column<int64_t>(by_col.c_str(), std::move(vals));
     }
     else if (by_type == "bool")
     {
         std::vector<uint8_t> vals(ngroups);
         for (size_t g = 0; g < ngroups; ++g) vals[g] = df_.get_column<uint8_t>(by_col.c_str())[group_rows[g].front()];
-        out.df_.load_column<uint8_t>(by_col.c_str(), vals);
+        out.df_.load_column<uint8_t>(by_col.c_str(), std::move(vals));
     }
     else
     {
         std::vector<std::string> vals(ngroups);
         for (size_t g = 0; g < ngroups; ++g) vals[g] = df_.get_column<std::string>(by_col.c_str())[group_rows[g].front()];
-        out.df_.load_column<std::string>(by_col.c_str(), vals);
+        out.df_.load_column<std::string>(by_col.c_str(), std::move(vals));
     }
     out.col_order_.push_back(by_col);
     out.col_types_[by_col] = by_type;
@@ -1031,9 +1025,21 @@ GrizzlarFrame GrizzlarFrame::groupby_agg(
         const std::string & func = agg_funcs[s];
         const std::string & col_t = require_numeric(col_types_, col);
         std::vector<double> vals(ngroups);
-        for (size_t g = 0; g < ngroups; ++g)
-            vals[g] = aggregate_group(df_, col_t, col, group_rows[g], func);
-        out.df_.load_column<double>(col.c_str(), vals);
+        if (col_t == "double")
+        {
+            const auto & c = df_.get_column<double>(col.c_str());
+            auto at = [&](size_t r) { return c[r]; };
+            for (size_t g = 0; g < ngroups; ++g)
+                vals[g] = aggregate_group(at, group_rows[g], func);
+        }
+        else
+        {
+            const auto & c = df_.get_column<int64_t>(col.c_str());
+            auto at = [&](size_t r) { return static_cast<double>(c[r]); };
+            for (size_t g = 0; g < ngroups; ++g)
+                vals[g] = aggregate_group(at, group_rows[g], func);
+        }
+        out.df_.load_column<double>(col.c_str(), std::move(vals));
         out.col_order_.push_back(col);
         out.col_types_[col] = "double";
     }
@@ -1480,48 +1486,127 @@ GrizzlarFrame GrizzlarFrame::read_csv_native(const std::string & path, const std
     // typed column (from_chars straight off the buffer for numeric
     // columns, no intermediate std::string at all; only actual string
     // columns ever construct a std::string).
-    std::vector<unsigned long> idx;
-    std::vector<std::vector<int64_t>> int_cols(ncols);
-    std::vector<std::vector<double>> dbl_cols(ncols);
-    std::vector<std::vector<std::string>> str_cols(ncols);
-    if (index_col < 0) idx.reserve(nrows_estimate);
-    for (size_t c = 0; c < ncols; ++c)
+    //
+    // For large files, the data region is split at newline boundaries into
+    // one chunk per pool thread, each parsed independently (no shared
+    // mutable state during parsing — every chunk only touches its own
+    // local vectors) and dispatched onto hmdf's already-running
+    // ThreadGranularity::thr_pool_. Results are merged in order afterward,
+    // moving (not copying) string cells into the final vectors. Small
+    // files stay on the single-chunk/single-threaded path unchanged —
+    // this must not regress already-fast small/numeric-heavy loads (the
+    // per-file stock-data benchmark loads are a few thousand rows each,
+    // comfortably under the threshold).
+    struct ChunkResult
     {
-        if (static_cast<long>(c) == index_col) continue;
-        if (type_id[c] == 0) int_cols[c].reserve(nrows_estimate);
-        else if (type_id[c] == 1) dbl_cols[c].reserve(nrows_estimate);
-        else str_cols[c].reserve(nrows_estimate);
-    }
+        size_t nrows{ 0 };
+        std::vector<unsigned long> idx;
+        std::vector<std::vector<int64_t>> int_cols;
+        std::vector<std::vector<double>> dbl_cols;
+        std::vector<std::vector<std::string>> str_cols;
+        explicit ChunkResult(size_t nc) : int_cols(nc), dbl_cols(nc), str_cols(nc) {}
+    };
 
-    size_t nrows = 0;
+    auto parse_chunk = [&](const char * cs, const char * ce) -> ChunkResult
     {
-        const char * p = data_start;
-        while (p < fend)
+        ChunkResult r(ncols);
+        std::string local_scratch;
+        const char * p = cs;
+        while (p < ce)
         {
-            const char * nl = static_cast<const char *>(std::memchr(p, '\n', static_cast<size_t>(fend - p)));
-            const char * line_end = nl ? nl : fend;
+            const char * nl = static_cast<const char *>(std::memchr(p, '\n', static_cast<size_t>(ce - p)));
+            const char * line_end = nl ? nl : ce;
             const char * row_end = (line_end > p && *(line_end - 1) == '\r') ? line_end - 1 : line_end;
             if (row_end > p)
             {
                 size_t c = 0;
-                for_each_csv_field(p, row_end, scratch, [&](const char * s, size_t len)
+                for_each_csv_field(p, row_end, local_scratch, [&](const char * s, size_t len)
                 {
                     if (c >= ncols) { ++c; return; }
                     if (static_cast<long>(c) == index_col)
-                    {
-                        idx.push_back(len == 0 ? 0ul : parse_ulong_field(s, len));
-                    }
+                        r.idx.push_back(len == 0 ? 0ul : parse_ulong_field(s, len));
                     else if (type_id[c] == 0)
-                        int_cols[c].push_back(len == 0 ? 0 : parse_int64_field(s, len));
+                        r.int_cols[c].push_back(len == 0 ? 0 : parse_int64_field(s, len));
                     else if (type_id[c] == 1)
-                        dbl_cols[c].push_back(len == 0 ? std::numeric_limits<double>::quiet_NaN() : parse_double_field(s, len));
+                        r.dbl_cols[c].push_back(len == 0 ? std::numeric_limits<double>::quiet_NaN() : parse_double_field(s, len));
                     else
-                        str_cols[c].emplace_back(s, len);
+                        r.str_cols[c].emplace_back(s, len);
                     ++c;
                 });
-                ++nrows;
+                ++r.nrows;
             }
-            p = nl ? nl + 1 : fend;
+            p = nl ? nl + 1 : ce;
+        }
+        return r;
+    };
+
+    constexpr size_t PARALLEL_PARSE_THRESHOLD = 50000;
+    std::vector<ChunkResult> chunks;
+    if (nrows_estimate >= PARALLEL_PARSE_THRESHOLD)
+    {
+        const size_t nthreads = std::min<size_t>(
+            std::max<size_t>(1, static_cast<size_t>(hmdf::ThreadGranularity::get_thread_level())), 16);
+        std::vector<const char *> chunk_starts(nthreads + 1);
+        chunk_starts[0] = data_start;
+        const size_t data_len = static_cast<size_t>(fend - data_start);
+        const size_t approx_chunk = (data_len + nthreads - 1) / nthreads;
+        for (size_t t = 1; t < nthreads; ++t)
+        {
+            const char * split = data_start + t * approx_chunk;
+            if (split >= fend) { chunk_starts[t] = fend; continue; }
+            const char * nl = static_cast<const char *>(std::memchr(split, '\n', static_cast<size_t>(fend - split)));
+            chunk_starts[t] = nl ? nl + 1 : fend;
+        }
+        chunk_starts[nthreads] = fend;
+
+        std::vector<std::future<ChunkResult>> futures;
+        futures.reserve(nthreads);
+        for (size_t t = 0; t < nthreads; ++t)
+        {
+            const char * cs = chunk_starts[t];
+            const char * ce = chunk_starts[t + 1];
+            if (cs >= ce) continue;
+            futures.push_back(hmdf::ThreadGranularity::thr_pool_.dispatch(false, parse_chunk, cs, ce));
+        }
+        chunks.reserve(futures.size());
+        for (auto & fut : futures) chunks.push_back(fut.get());
+    }
+    else
+    {
+        chunks.push_back(parse_chunk(data_start, fend));
+    }
+
+    size_t nrows = 0;
+    for (const auto & ch : chunks) nrows += ch.nrows;
+
+    std::vector<unsigned long> idx;
+    std::vector<std::vector<int64_t>> int_cols(ncols);
+    std::vector<std::vector<double>> dbl_cols(ncols);
+    std::vector<std::vector<std::string>> str_cols(ncols);
+    idx.reserve(nrows);
+    for (size_t c = 0; c < ncols; ++c)
+    {
+        if (static_cast<long>(c) == index_col) continue;
+        if (type_id[c] == 0) int_cols[c].reserve(nrows);
+        else if (type_id[c] == 1) dbl_cols[c].reserve(nrows);
+        else str_cols[c].reserve(nrows);
+    }
+
+    for (auto & ch : chunks)
+    {
+        if (index_col >= 0)
+            idx.insert(idx.end(), ch.idx.begin(), ch.idx.end());
+        for (size_t c = 0; c < ncols; ++c)
+        {
+            if (static_cast<long>(c) == index_col) continue;
+            if (type_id[c] == 0)
+                int_cols[c].insert(int_cols[c].end(), ch.int_cols[c].begin(), ch.int_cols[c].end());
+            else if (type_id[c] == 1)
+                dbl_cols[c].insert(dbl_cols[c].end(), ch.dbl_cols[c].begin(), ch.dbl_cols[c].end());
+            else
+                str_cols[c].insert(str_cols[c].end(),
+                    std::make_move_iterator(ch.str_cols[c].begin()),
+                    std::make_move_iterator(ch.str_cols[c].end()));
         }
     }
 
@@ -1541,17 +1626,17 @@ GrizzlarFrame GrizzlarFrame::read_csv_native(const std::string & path, const std
         const std::string & name = headers[c];
         if (type_id[c] == 0)
         {
-            out.df_.load_column<int64_t>(name.c_str(), int_cols[c]);
+            out.df_.load_column<int64_t>(name.c_str(), std::move(int_cols[c]));
             out.col_types_[name] = "int64";
         }
         else if (type_id[c] == 1)
         {
-            out.df_.load_column<double>(name.c_str(), dbl_cols[c]);
+            out.df_.load_column<double>(name.c_str(), std::move(dbl_cols[c]));
             out.col_types_[name] = "double";
         }
         else
         {
-            out.df_.load_column<std::string>(name.c_str(), str_cols[c]);
+            out.df_.load_column<std::string>(name.c_str(), std::move(str_cols[c]));
             out.col_types_[name] = "string";
         }
         out.col_order_.push_back(name);
@@ -1662,25 +1747,25 @@ void GrizzlarFrame::astype_col(const std::string & col, const std::string & targ
         std::vector<double> vals(n);
         for (size_t i = 0; i < n; ++i)
             vals[i] = as_str[i].empty() ? std::numeric_limits<double>::quiet_NaN() : std::strtod(as_str[i].c_str(), nullptr);
-        df_.load_column<double>(col.c_str(), vals);
+        df_.load_column<double>(col.c_str(), std::move(vals));
     }
     else if (target_type == "int64")
     {
         std::vector<int64_t> vals(n);
         for (size_t i = 0; i < n; ++i)
             vals[i] = as_str[i].empty() ? 0 : std::strtoll(as_str[i].c_str(), nullptr, 10);
-        df_.load_column<int64_t>(col.c_str(), vals);
+        df_.load_column<int64_t>(col.c_str(), std::move(vals));
     }
     else if (target_type == "bool")
     {
         std::vector<uint8_t> vals(n);
         for (size_t i = 0; i < n; ++i)
             vals[i] = (as_str[i] == "1" || as_str[i] == "true" || as_str[i] == "True") ? 1 : 0;
-        df_.load_column<uint8_t>(col.c_str(), vals);
+        df_.load_column<uint8_t>(col.c_str(), std::move(vals));
     }
     else
     {
-        df_.load_column<std::string>(col.c_str(), as_str);
+        df_.load_column<std::string>(col.c_str(), std::move(as_str));
     }
     col_types_[col] = target_type;
 }
@@ -1807,7 +1892,7 @@ GrizzlarFrame GrizzlarFrame::isna_frame() const
             const auto & c = df_.get_column<std::string>(name.c_str());
             for (size_t i = 0; i < n; ++i) mask[i] = c[i].empty() ? 1 : 0;
         }
-        out.df_.load_column<uint8_t>(name.c_str(), mask);
+        out.df_.load_column<uint8_t>(name.c_str(), std::move(mask));
         out.col_order_.push_back(name);
         out.col_types_[name] = "bool";
     }
@@ -1919,7 +2004,7 @@ GrizzlarFrame GrizzlarFrame::compare_scalar(const std::string & op, double scala
         std::vector<uint8_t> mask(data.size());
         for (size_t i = 0; i < data.size(); ++i)
             mask[i] = apply_op(op, data[i], scalar) ? 1 : 0;
-        out.df_.load_column<uint8_t>(name.c_str(), mask);
+        out.df_.load_column<uint8_t>(name.c_str(), std::move(mask));
         out.col_order_.push_back(name);
         out.col_types_[name] = "bool";
     }
@@ -1993,7 +2078,7 @@ GrizzlarFrame GrizzlarFrame::transpose_frame() const
             else if (type == "bool")  col[j] = static_cast<double>(df_.get_column<uint8_t>(name.c_str())[i]);
         }
         const std::string new_name = std::to_string(idx[i]);
-        out.df_.load_column<double>(new_name.c_str(), col);
+        out.df_.load_column<double>(new_name.c_str(), std::move(col));
         out.col_order_.push_back(new_name);
         out.col_types_[new_name] = "double";
     }
@@ -2039,7 +2124,7 @@ GrizzlarFrame GrizzlarFrame::reset_index_frame(bool drop) const
 
     if (!drop)
     {
-        out.df_.load_column<int64_t>("index", idx_as_int64);
+        out.df_.load_column<int64_t>("index", std::move(idx_as_int64));
         out.col_order_.insert(out.col_order_.begin(), "index");
         out.col_types_["index"] = "int64";
     }
@@ -2073,7 +2158,7 @@ GrizzlarFrame GrizzlarFrame::melt_frame(
             std::vector<double> rep(out_n);
             for (size_t v = 0; v < nval; ++v)
                 for (size_t i = 0; i < n; ++i) rep[v * n + i] = c[i];
-            out.df_.load_column<double>(id_col.c_str(), rep);
+            out.df_.load_column<double>(id_col.c_str(), std::move(rep));
         }
         else if (type == "int64")
         {
@@ -2081,7 +2166,7 @@ GrizzlarFrame GrizzlarFrame::melt_frame(
             std::vector<int64_t> rep(out_n);
             for (size_t v = 0; v < nval; ++v)
                 for (size_t i = 0; i < n; ++i) rep[v * n + i] = c[i];
-            out.df_.load_column<int64_t>(id_col.c_str(), rep);
+            out.df_.load_column<int64_t>(id_col.c_str(), std::move(rep));
         }
         else if (type == "string")
         {
@@ -2089,7 +2174,7 @@ GrizzlarFrame GrizzlarFrame::melt_frame(
             std::vector<std::string> rep(out_n);
             for (size_t v = 0; v < nval; ++v)
                 for (size_t i = 0; i < n; ++i) rep[v * n + i] = c[i];
-            out.df_.load_column<std::string>(id_col.c_str(), rep);
+            out.df_.load_column<std::string>(id_col.c_str(), std::move(rep));
         }
         out.col_order_.push_back(id_col);
         out.col_types_[id_col] = type;
@@ -2109,8 +2194,8 @@ GrizzlarFrame GrizzlarFrame::melt_frame(
             else if (type == "bool")  value_col[v * n + i] = static_cast<double>(df_.get_column<uint8_t>(vc.c_str())[i]);
         }
     }
-    out.df_.load_column<std::string>(var_name.c_str(), var_col);
-    out.df_.load_column<double>(value_name.c_str(), value_col);
+    out.df_.load_column<std::string>(var_name.c_str(), std::move(var_col));
+    out.df_.load_column<double>(value_name.c_str(), std::move(value_col));
     out.col_order_.push_back(var_name);
     out.col_types_[var_name] = "string";
     out.col_order_.push_back(value_name);
