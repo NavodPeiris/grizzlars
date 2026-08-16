@@ -1,0 +1,112 @@
+name: Sync hmdf release
+
+# hmdf (hosseinmoein/DataFrame, vendored as the cpp_lib/DataFrame submodule)
+# has no way to push an event into this repo, so this polls its releases
+# instead. On a new release it bumps the submodule pin + pyproject.toml
+# version to match and opens a PR — it never pushes a tag itself, so it
+# never triggers build.yml's PyPI publish. That stays a deliberate human
+# action (push `v<version>` after reviewing/testing the PR).
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Get latest hmdf release tag
+        id: hmdf
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          tag=$(gh api repos/hosseinmoein/DataFrame/releases/latest --jq .tag_name)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Compare against current grizzlars version
+        id: compare
+        run: |
+          current=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          if [ "$current" = "${{ steps.hmdf.outputs.tag }}" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check for an already-open sync PR
+        if: steps.compare.outputs.up_to_date == 'false'
+        id: existing_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          branch="bot/sync-hmdf-${{ steps.hmdf.outputs.tag }}"
+          count=$(gh pr list --head "$branch" --state open --json number --jq 'length')
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "exists=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Bump submodule pin + version
+        if: steps.compare.outputs.up_to_date == 'false' && steps.existing_pr.outputs.exists == '0'
+        run: |
+          set -e
+          cd cpp_lib/DataFrame
+          git fetch --tags origin
+          git checkout "${{ steps.hmdf.outputs.tag }}"
+          cd ../..
+          sed -i -E "s/^version = \".*\"/version = \"${{ steps.hmdf.outputs.tag }}\"/" pyproject.toml
+
+      # Sanity-gate: don't open a PR for a pin that doesn't even build.
+      - name: Build + test against the new pin
+        if: steps.compare.outputs.up_to_date == 'false' && steps.existing_pr.outputs.exists == '0'
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y libtbb-dev
+          python -m pip install --upgrade pip uv
+          uv sync --reinstall
+          uv run pytest tests/functional -q
+
+      - name: Open PR
+        if: steps.compare.outputs.up_to_date == 'false' && steps.existing_pr.outputs.exists == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          branch="${{ steps.existing_pr.outputs.branch }}"
+          git checkout -b "$branch"
+          git add cpp_lib/DataFrame pyproject.toml
+          git commit -m "sync: bump to hmdf ${{ steps.hmdf.outputs.tag }}"
+          git push origin "$branch"
+          tag="${{ steps.hmdf.outputs.tag }}"
+          body="$(cat <<'EOF'
+          hmdf released a new version.
+
+          This bumps the `cpp_lib/DataFrame` submodule pin and `pyproject.toml`'s
+          version to match. Build + `tests/functional` passed in CI before this PR
+          was opened.
+
+          Merging this PR does **not** publish anything. To cut the release,
+          after merging:
+
+          ```
+          git tag vTAG
+          git push origin vTAG
+          ```
+          which triggers `build.yml` and publishes to PyPI.
+          EOF
+          )"
+          body="${body//TAG/$tag}"
+          gh pr create --title "Sync hmdf $tag" --base main --body "$body"
