@@ -67,7 +67,21 @@ add_custom_target(generate_grizzlars_glue DEPENDS ${GENERATED_GLUE})
 option(PORTABLE_BUILD "Build for portability rather than native CPU" OFF)
 
 # ── the nanobind extension module ─────────────────────────────────────────
-nanobind_add_module(_grizzlars src/grizzlars_module.cpp src/grizzlars_shim.cpp)
+# grizzlars_shim.cpp is split into multiple single-concern translation
+# units (grizzlars_shim_*.cpp) sharing grizzlars_shim.h/grizzlars_shim_internal.h.
+nanobind_add_module(_grizzlars
+    src/grizzlars_module.cpp
+    src/grizzlars_shim_core.cpp
+    src/grizzlars_shim_stats.cpp
+    src/grizzlars_shim_filter_sort.cpp
+    src/grizzlars_shim_groupby_join.cpp
+    src/grizzlars_shim_missing.cpp
+    src/grizzlars_shim_window.cpp
+    src/grizzlars_shim_io.cpp
+    src/grizzlars_shim_cleaning.cpp
+    src/grizzlars_shim_reduction.cpp
+    src/grizzlars_shim_reshape.cpp
+)
 add_dependencies(_grizzlars generate_grizzlars_glue)
 target_include_directories(_grizzlars PRIVATE ${GENERATED_DIR})
 target_link_libraries(_grizzlars PRIVATE DataFrame::DataFrame)
