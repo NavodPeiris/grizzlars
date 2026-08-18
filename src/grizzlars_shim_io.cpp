@@ -129,7 +129,19 @@ int64_t parse_int64_field(const char * s, size_t len)
 double parse_double_field(const char * s, size_t len)
 {
     double v = std::numeric_limits<double>::quiet_NaN();
+#if defined(__APPLE__)
+    // libc++'s std::from_chars<double> is only implemented since macOS 26
+    // (the integer overloads above have been fine for years) — our
+    // deployment target is far below that, so this falls back to strtod on
+    // Apple only. Safe without an explicit end bound: s always points into
+    // the file's std::string buffer, which is guaranteed NUL-terminated at
+    // data()[size()], and CSV fields are delimiter-terminated well before
+    // that in every other case.
+    (void)len;
+    v = std::strtod(s, nullptr);
+#else
     std::from_chars(s, s + len, v);
+#endif
     return v;
 }
 
