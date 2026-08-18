@@ -34,7 +34,13 @@ jobs:
           # Also ensure patchelf/unzip/zip are available in the manylinux image
           CIBW_BEFORE_ALL_LINUX: >
             dnf install -y tbb-devel patchelf unzip zip || yum install -y tbb-devel patchelf unzip zip || true
+          # cpp_lib/DataFrame (unedited upstream) uses std::ranges::contains,
+          # a C++23 library feature only implemented since Xcode 16 — select
+          # whichever Xcode is newest on the runner (by path, not a hardcoded
+          # version) since default-selected Xcode varies per macOS runner
+          # image and GitHub periodically swaps exact point releases in/out.
           CIBW_BEFORE_ALL_MACOS: >
+            sudo xcode-select -s $(ls -d /Applications/Xcode_*.app | sort | tail -1) &&
             brew install tbb
 
           # PORTABLE_BUILD strips -march=native so the wheel runs on any
